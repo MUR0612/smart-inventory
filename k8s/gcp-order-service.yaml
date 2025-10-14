@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: smart-inventory
+  labels:
+    app: order-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: gcr.io/PROJECT_ID/order-service:latest
+        ports:
+        - containerPort: 8002
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: DB_URL
+        - name: INVENTORY_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: INVENTORY_BASE_URL
+        livenessProbe:
+          httpGet:
+            path: /api/healthz
+            port: 8002
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: 8002
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: smart-inventory
+spec:
+  selector:
+    app: order-service
+  ports:
+  - port: 8002
+    targetPort: 8002
+  type: ClusterIP

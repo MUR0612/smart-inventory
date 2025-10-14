@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smart-inventory-config
+  namespace: smart-inventory
+data:
+  MYSQL_DATABASE: "smart_inventory"
+  MYSQL_USER: "inventory_user"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  INVENTORY_PORT: "8001"
+  ORDER_PORT: "8002"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smart-inventory-secret
+  namespace: smart-inventory
+type: Opaque
+data:
+  MYSQL_ROOT_PASSWORD: cm9vdHBhc3N3b3JkMTIz  # base64 encoded "rootpassword123"
+  MYSQL_PASSWORD: aW52ZW50b3J5X3Bhc3MxMjM=  # base64 encoded "inventory_pass123"
