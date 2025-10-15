@@ -1,8 +1,14 @@
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 from sqlalchemy import String, Numeric, BigInteger, Integer, DateTime, Text
 from datetime import datetime
+import pytz
 
 Base = declarative_base()
+
+def get_aest_time():
+    """Get current time in AEST timezone"""
+    aest = pytz.timezone('Australia/Sydney')
+    return datetime.now(aest)
 
 class Order(Base):
     __tablename__ = "orders"
@@ -13,8 +19,8 @@ class Order(Base):
     customer_email: Mapped[str] = mapped_column(String(255), nullable=True)
     shipping_address: Mapped[str] = mapped_column(Text, nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=get_aest_time)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=get_aest_time, onupdate=get_aest_time)
     paid_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     shipped_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 

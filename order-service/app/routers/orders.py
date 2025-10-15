@@ -286,3 +286,23 @@ async def cancel_order(order_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(500, f"Failed to cancel order: {str(e)}")
 
+@router.delete("/{order_id}/delete")
+async def delete_order(order_id: int, db: Session = Depends(get_db)):
+    """刪除訂單"""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(404, "Order not found")
+    
+    # 檢查訂單狀態，只有特定狀態的訂單才能被刪除
+    if order.status in ["SHIPPED"]:
+        raise HTTPException(400, f"Cannot delete order in {order.status} status")
+    
+    # 刪除訂單項目
+    db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
+    
+    # 刪除訂單
+    db.delete(order)
+    db.commit()
+    
+    return {"message": "Order deleted successfully"}
+

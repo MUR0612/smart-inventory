@@ -2,7 +2,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 from sqlalchemy.orm import Session
+import pytz
 from ..models import Order
+
+def get_aest_time():
+    """Get current time in AEST timezone"""
+    aest = pytz.timezone('Australia/Sydney')
+    return datetime.now(aest)
 
 class OrderStatus(str, Enum):
     CREATED = "CREATED"
@@ -52,20 +58,20 @@ class OrderWorkflowService:
         # 更新狀態
         old_status = order.status
         order.status = new_status
-        order.updated_at = datetime.utcnow()
+        order.updated_at = get_aest_time()
         
         # 根據狀態設定相應的時間戳
         if new_status == OrderStatus.PAID.value:
-            order.paid_at = datetime.utcnow()
+            order.paid_at = get_aest_time()
         elif new_status == OrderStatus.SHIPPED.value:
-            order.shipped_at = datetime.utcnow()
+            order.shipped_at = get_aest_time()
         
         # 更新備註
         if notes:
             if order.notes:
-                order.notes += f"\n[{datetime.utcnow().isoformat()}] {notes}"
+                order.notes += f"\n[{get_aest_time().isoformat()}] {notes}"
             else:
-                order.notes = f"[{datetime.utcnow().isoformat()}] {notes}"
+                order.notes = f"[{get_aest_time().isoformat()}] {notes}"
         
         db.commit()
         db.refresh(order)

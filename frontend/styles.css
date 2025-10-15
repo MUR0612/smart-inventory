@@ -88,3 +88,76 @@
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
 }
+
+/* Table row height consistency */
+.table tbody tr {
+    height: 60px; /* 固定行高 */
+}
+
+.table tbody td {
+    vertical-align: middle; /* 垂直居中對齊 */
+    padding: 12px 8px; /* 統一的內邊距 */
+}
+
+/* 確保按鈕組在同一行且對齊 */
+.table tbody td:last-child {
+    white-space: nowrap; /* 防止按鈕換行 */
+}
+
+.table tbody td:last-child .btn {
+    margin-right: 4px; /* 按鈕間距 */
+    vertical-align: middle; /* 按鈕垂直居中 */
+}
+
+/* 確保狀態徽章對齊 */
+.table tbody td .badge {
+    vertical-align: middle;
+    display: inline-block;
+}
+
+/* 確保排序按鈕對齊 */
+.table thead th .btn {
+    vertical-align: middle;
+    margin-left: 4px;
+}
+
+/* 排序按鈕樣式 */
+.sort-btn {
+    width: 12px !important;
+    height: 12px !important;
+    padding: 0 !important;
+    font-size: 10px !important;
+    line-height: 1 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    margin-left: 4px !important;
+    border: 1px solid #6c757d !important;
+    background-color: #f8f9fa !important;
+    vertical-align: middle !important;
+}
+
+.sort-btn:hover {
+    background-color: #e9ecef !important;
+}
+
+.sort-btn i {
+    font-size: 8px !important;
+    line-height: 1 !important;
+    vertical-align: middle !important;
+    display: inline-block !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* 確保表頭文字和按鈕對齊 */
+.table thead th {
+    vertical-align: middle !important;
+    text-align: left !important;
+}
+
+.table thead th .sort-btn {
+    vertical-align: middle !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}

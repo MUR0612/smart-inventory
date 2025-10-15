@@ -14,6 +14,7 @@ class ProductCreate(BaseModel):
     name: str
     price: float
     safety_stock: int = 0
+    stock: int = 0
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -42,7 +43,7 @@ def create_product(body: ProductCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="SKU already exists")
     p = Product(sku=body.sku, name=body.name, price=body.price, safety_stock=body.safety_stock)
     db.add(p); db.flush()
-    inv = Inventory(product_id=p.id, stock=0)
+    inv = Inventory(product_id=p.id, stock=body.stock)
     db.add(inv); db.commit(); db.refresh(p)
 
     # 失效快取

@@ -1,5 +1,6 @@
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from .db import engine
 from .models import Base
@@ -24,6 +25,15 @@ for i in range(RETRIES):
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Order Service")
+
+# 添加 CORS 中間件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允許所有來源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允許所有方法
+    allow_headers=["*"],  # 允許所有標頭
+)
 
 @app.on_event("startup")
 async def startup_event():

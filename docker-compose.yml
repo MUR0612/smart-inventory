@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   mysql:
-    image: mysql:8.0
+    image: mysql:5.7
     container_name: inv-mysql
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -32,7 +32,7 @@ services:
     container_name: inv-inventory
     restart: unless-stopped
     environment:
-      DB_URL: ${DB_URL}
+      DB_URL: mysql+pymysql://root:rootpassword@mysql:3306/smart_inventory
       REDIS_HOST: ${REDIS_HOST}
       REDIS_PORT: ${REDIS_PORT}
     depends_on:
@@ -49,7 +49,7 @@ services:
     container_name: inv-order
     restart: unless-stopped
     environment:
-      DB_URL: ${DB_URL}
+      DB_URL: mysql+pymysql://root:rootpassword@mysql:3306/smart_inventory
       INVENTORY_BASE_URL: http://inventory-service:8001
     depends_on:
       mysql:
@@ -69,6 +69,7 @@ services:
       - "8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
 
 volumes:
   mysql-data:
