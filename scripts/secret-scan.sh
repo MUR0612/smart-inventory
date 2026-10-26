@@ -14,7 +14,8 @@ if [[ "${1:-}" == "--history" ]]; then
   docker run --rm -v "$(hp "$ROOT"):/repo:ro" "$IMAGE" git /repo --redact --no-banner -v || exit 1
   exit 0
 elif [[ -n "${1:-}" ]]; then
-  (cd "$WORK" && unzip -q "$(hp "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")")")
+  ZIP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"  # resolve before changing directory
+  (cd "$WORK" && unzip -q "$(hp "$ZIP")")
 else
   # Copy only tracked + new non-ignored files, so local .env files are not "found".
   (cd "$ROOT" && git ls-files -z --cached --others --exclude-standard | tar --null -T - -cf - | tar -xf - -C "$WORK")
