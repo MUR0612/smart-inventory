@@ -1,1414 +1,729 @@
-// API Configuration
-const API_BASE = {
-    inventory: 'http://localhost:8001/api',
-    orders: 'http://localhost:8002/api'
+'use strict';
+
+// Same-origin API paths: the browser only ever talks to the gateway that
+// served this page (Nginx locally, the Ingress/LB in Kubernetes).
+const API = { auth: '/api/auth', inventory: '/api/inventory', orders: '/api/orders' };
+const ORDERS_PAGE_SIZE = 50;
+
+const state = {
+    token: null,
+    user: null,
+    role: null,
+    products: [],
+    sort: { field: null, direction: 'default' },
+    ordersSkip: 0,
+    ordersTotal: 0,
+    orderIdempotencyKey: null,
+    charts: {},
 };
 
-// Global variables
-let products = [];
-let orders = [];
-let inventoryData = [];
-let filteredProducts = [];
-let currentSort = { field: null, direction: 'asc' };
-let charts = {};
+// ------------------------------------------------------------------ DOM helpers
+// All API data is inserted as text (textContent / text nodes / Option text),
+// never as HTML, so stored values such as product names cannot run scripts.
 
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', function() {
-    loadDashboardData();
-    loadProducts();
-    loadOrders();
-    loadInventory();
-});
-
-// Show different sections
-function showSection(sectionName) {
-    // Hide all sections
-    document.querySelectorAll('.content-section').forEach(section => {
-        section.style.display = 'none';
-    });
-    
-    // Show selected section
-    document.getElementById(sectionName + '-section').style.display = 'block';
-    
-    // Update navigation state
-    document.querySelectorAll('.nav-link').forEach(link => {
-        link.classList.remove('active');
-    });
-    event.target.classList.add('active');
-    
-    // Reload data
-    if (sectionName === 'dashboard') {
-        loadDashboardData();
-    } else if (sectionName === 'products') {
-        loadProducts();
-    } else if (sectionName === 'inventory') {
-        loadInventory();
-    } else if (sectionName === 'orders') {
-        loadOrders();
-    } else if (sectionName === 'reports') {
-        loadReports();
+function h(tag, attrs = {}, ...children) {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs)) {
+        if (value === null || value === undefined || value === false) continue;
+        if (key === 'class') el.className = value;
+        else if (key === 'dataset') Object.assign(el.dataset, value);
+        else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2), value);
+        else el.setAttribute(key, value === true ? '' : String(value));
     }
+    for (const child of children.flat()) {
+        if (child === null || child === undefined || child === false) continue;
+        el.append(child instanceof Node ? child : String(child));
+    }
+    return el;
 }
 
-// Load dashboard data
-async function loadDashboardData() {
-    try {
-        // Load statistics
-        const [productsRes, ordersRes, lowStockRes, healthRes] = await Promise.all([
-            fetch(`${API_BASE.inventory}/inventory/products`),
-            fetch(`${API_BASE.orders}/orders/`),
-            fetch(`${API_BASE.inventory}/inventory/low-stock`),
-            fetch(`${API_BASE.inventory}/healthz`)
-        ]);
+function $(id) { return document.getElementById(id); }
 
-        const productsData = await productsRes.json();
-        const ordersData = await ordersRes.json();
-        const lowStockData = await lowStockRes.json();
-        const healthData = await healthRes.json();
+function setText(id, value) { $(id).textContent = value; }
 
-        // 計算庫存警告統計
-        const outOfStockCount = productsData.filter(p => (p.stock || 0) === 0).length;
-        const lowStockCount = productsData.filter(p => {
-            const stock = p.stock || 0;
-            const safetyStock = p.safety_stock || 0;
-            return stock > 0 && stock <= safetyStock;
-        }).length;
-        const totalStockAlerts = outOfStockCount + lowStockCount;
+function icon(name) { return h('i', { class: `fas ${name}` }); }
 
-        // Update statistics
-        document.getElementById('total-products').textContent = productsData.length || 0;
-        document.getElementById('total-orders').textContent = ordersData.length || 0;
-        document.getElementById('low-stock-count').textContent = totalStockAlerts || 0;
-        document.getElementById('system-status').textContent = healthData.status === 'ok' ? 'Healthy' : 'Unhealthy';
-
-        // Load low stock and out of stock alerts
-        loadStockAlerts(productsData);
-
-        // Load inventory chart
-        loadInventoryChart(productsData);
-
-    } catch (error) {
-        console.error('Error loading dashboard data:', error);
-        showAlert('Error loading dashboard data', 'danger');
-    }
+function messageRow(colspan, text, cls = 'text-muted') {
+    return h('tr', {}, h('td', { colspan, class: `text-center ${cls}` }, text));
 }
 
-// Load low stock alerts
-function loadStockAlerts(productsData) {
-    const container = document.getElementById('low-stock-list');
-    
-    // 分類產品：Out of Stock 和 Low Stock
-    const outOfStockItems = [];
-    const lowStockItems = [];
-    
-    productsData.forEach(product => {
-        const stock = product.stock || 0;
-        const safetyStock = product.safety_stock || 0;
-        
-        if (stock === 0) {
-            outOfStockItems.push(product);
-        } else if (stock <= safetyStock) {
-            lowStockItems.push(product);
+function money(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? `$${n.toFixed(2)}` : '—';
+}
+
+function dateTime(iso) {
+    return iso ? new Date(iso).toLocaleString(undefined, { timeZoneName: 'short' }) : '—';
+}
+
+function newKey() {
+    return (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+}
+
+function showAlert(message, type = 'info') {
+    const alert = h('div', { class: `alert alert-${type} alert-dismissible fade show`, role: 'alert' },
+        h('span', {}, message),
+        h('button', { type: 'button', class: 'btn-close', 'data-bs-dismiss': 'alert', 'aria-label': 'Close' }));
+    $('alerts').append(alert);
+    setTimeout(() => alert.remove(), 6000);
+}
+
+function modal(id) { return bootstrap.Modal.getOrCreateInstance($(id)); }
+
+// ------------------------------------------------------------------ session
+
+const storage = {
+    get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { sessionStorage.setItem(key, value); } catch { /* private mode */ } },
+    clear() { try { sessionStorage.clear(); } catch { /* ignore */ } },
+};
+
+class ApiError extends Error {
+    constructor(status, detail) {
+        super(ApiError.describe(detail) || `Request failed (${status})`);
+        this.status = status;
+    }
+
+    static describe(detail) {
+        if (!detail) return '';
+        if (typeof detail === 'string') return detail;
+        if (Array.isArray(detail)) return detail.map(d => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ');
+        if (detail.message) {
+            const items = (detail.items || []).map(i => `product ${i.product_id}: requested ${i.requested}, available ${i.available}`);
+            return [detail.message, ...items].join(' — ');
         }
-    });
-    
-    let html = '';
-    
-    // 顯示 Out of Stock 項目（紅色警告）
-    if (outOfStockItems.length > 0) {
-        html += '<h6 class="text-danger mb-2"><i class="fas fa-exclamation-triangle"></i> Out of Stock</h6>';
-        outOfStockItems.forEach(item => {
-            html += `
-                <div class="alert alert-danger alert-dismissible fade show mb-2" role="alert">
-                    <strong>${item.sku}</strong> - ${item.name}<br>
-                    <small>Current: <span class="text-danger fw-bold">${item.stock || 0}</span> | Safety: ${item.safety_stock || 0}</small>
-                </div>
-            `;
-        });
+        return JSON.stringify(detail);
     }
-    
-    // 顯示 Low Stock 項目（黃色警告）
-    if (lowStockItems.length > 0) {
-        html += '<h6 class="text-warning mb-2"><i class="fas fa-exclamation-circle"></i> Low Stock</h6>';
-        lowStockItems.forEach(item => {
-            html += `
-                <div class="alert alert-warning alert-dismissible fade show mb-2" role="alert">
-                    <strong>${item.sku}</strong> - ${item.name}<br>
-                    <small>Current: <span class="text-warning fw-bold">${item.stock || 0}</span> | Safety: ${item.safety_stock || 0}</small>
-                </div>
-            `;
-        });
-    }
-    
-    // 如果沒有任何警告項目
-    if (outOfStockItems.length === 0 && lowStockItems.length === 0) {
-        html = '<div class="text-center text-muted">No stock alerts</div>';
-    }
-    
-    container.innerHTML = html;
 }
 
-// Load inventory chart
-function loadInventoryChart(productsData) {
-    const ctx = document.getElementById('inventoryChart').getContext('2d');
-    
-    // Destroy existing chart
-    if (charts.inventory) {
-        charts.inventory.destroy();
+async function api(path, { method = 'GET', body, headers = {} } = {}) {
+    const init = { method, headers: { ...headers } };
+    if (state.token) init.headers.Authorization = `Bearer ${state.token}`;
+    if (body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
     }
+    const response = await fetch(path, init);
+    let data = null;
+    try { data = await response.json(); } catch { /* empty or non-JSON body */ }
+    if (response.status === 401 && path !== `${API.auth}/login`) {
+        logout('Your session has expired. Please sign in again.');
+    }
+    if (!response.ok) throw new ApiError(response.status, data && data.detail);
+    return data;
+}
 
-    const labels = productsData.map(p => p.name);
-    const stockData = productsData.map(p => p.stock || 0);
-    const safetyStockData = productsData.map(p => p.safety_stock || 0);
+function applySession() {
+    const signedIn = Boolean(state.token);
+    $('login-view').hidden = signedIn;
+    $('app-view').hidden = !signedIn;
+    document.body.classList.toggle('role-viewer', state.role !== 'staff');
+    setText('current-user', state.user || '');
+    setText('current-role', state.role || '');
+}
 
-    charts.inventory = new Chart(ctx, {
+async function login(event) {
+    event.preventDefault();
+    $('login-error').hidden = true;
+    try {
+        const data = await api(`${API.auth}/login`, {
+            method: 'POST',
+            body: { username: $('login-username').value, password: $('login-password').value },
+        });
+        state.token = data.access_token;
+        state.user = data.username;
+        state.role = data.role;
+        storage.set('token', state.token);
+        storage.set('user', state.user);
+        storage.set('role', state.role);
+        $('login-password').value = '';
+        applySession();
+        showSection('dashboard');
+    } catch (error) {
+        $('login-error').textContent = error.status === 429 ? 'Too many attempts, wait a minute.' : error.message;
+        $('login-error').hidden = false;
+    }
+}
+
+function logout(message) {
+    state.token = state.user = state.role = null;
+    storage.clear();
+    applySession();
+    if (message) {
+        $('login-error').textContent = message;
+        $('login-error').hidden = false;
+    }
+}
+
+// ------------------------------------------------------------------ navigation
+
+function showSection(name) {
+    document.querySelectorAll('.content-section').forEach(s => { s.hidden = s.id !== `${name}-section`; });
+    document.querySelectorAll('.nav-link[data-section]').forEach(link => {
+        link.classList.toggle('active', link.dataset.section === name);
+    });
+    const loaders = {
+        dashboard: loadDashboard, products: loadProducts, inventory: loadInventory,
+        orders: loadOrders, reports: loadReports,
+    };
+    (loaders[name] || loadDashboard)();
+}
+
+// ------------------------------------------------------------------ dashboard
+
+function stockStatus(product) {
+    const stock = product.stock || 0;
+    if (stock === 0) return { text: 'Out of Stock', badge: 'bg-danger', cls: 'text-danger' };
+    if (stock <= (product.safety_stock || 0)) return { text: 'Low Stock', badge: 'bg-warning', cls: 'text-warning' };
+    return { text: 'In Stock', badge: 'bg-success', cls: '' };
+}
+
+async function loadDashboard() {
+    const [products, invStats, orderStats, health] = await Promise.allSettled([
+        api(`${API.inventory}/products`),
+        api(`${API.inventory}/stats`),
+        api(`${API.orders}/stats`),
+        api(`${API.inventory}/healthz`),
+    ]);
+    // A failed request shows "—" instead of a misleading 0.
+    setText('total-products', invStats.status === 'fulfilled' ? invStats.value.total_products : '—');
+    setText('total-orders', orderStats.status === 'fulfilled' ? orderStats.value.total_orders : '—');
+    setText('low-stock-count', invStats.status === 'fulfilled'
+        ? invStats.value.low_stock + invStats.value.out_of_stock : '—');
+    setText('system-status', health.status === 'fulfilled'
+        ? (health.value.status === 'ok' ? 'Healthy' : 'Degraded') : 'Unavailable');
+
+    if (products.status === 'fulfilled') {
+        renderStockAlerts(products.value);
+        renderInventoryChart(products.value);
+    } else {
+        $('low-stock-list').replaceChildren(h('div', { class: 'text-danger' }, 'Could not load products'));
+    }
+}
+
+function renderStockAlerts(products) {
+    const out = products.filter(p => (p.stock || 0) === 0);
+    const low = products.filter(p => (p.stock || 0) > 0 && p.stock <= (p.safety_stock || 0));
+    const block = (title, cls, items) => items.length ? [
+        h('h6', { class: `text-${cls} mb-2` }, title),
+        items.map(p => h('div', { class: `alert alert-${cls} mb-2` },
+            h('strong', {}, p.sku), ` - ${p.name}`, h('br'),
+            h('small', {}, `Current: ${p.stock || 0} | Safety: ${p.safety_stock || 0}`))),
+    ] : [];
+    const content = [...block('Out of Stock', 'danger', out), ...block('Low Stock', 'warning', low)];
+    $('low-stock-list').replaceChildren(...(content.length
+        ? content.flat() : [h('div', { class: 'text-center text-muted' }, 'No stock alerts')]));
+}
+
+function renderChart(key, canvasId, config) {
+    if (state.charts[key]) state.charts[key].destroy();
+    if (typeof Chart === 'undefined') return;  // CDN blocked: data tables still work
+    state.charts[key] = new Chart($(canvasId).getContext('2d'), config);
+}
+
+function renderInventoryChart(products) {
+    renderChart('inventory', 'inventoryChart', {
         type: 'bar',
         data: {
-            labels: labels,
-            datasets: [{
-                label: 'Current Stock',
-                data: stockData,
-                backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                borderColor: 'rgba(54, 162, 235, 1)',
-                borderWidth: 1
-            }, {
-                label: 'Safety Stock',
-                data: safetyStockData,
-                backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                borderColor: 'rgba(255, 99, 132, 1)',
-                borderWidth: 1
-            }]
+            labels: products.map(p => p.name),
+            datasets: [
+                { label: 'Current Stock', data: products.map(p => p.stock || 0),
+                  backgroundColor: 'rgba(54, 162, 235, 0.2)', borderColor: 'rgba(54, 162, 235, 1)', borderWidth: 1 },
+                { label: 'Safety Stock', data: products.map(p => p.safety_stock || 0),
+                  backgroundColor: 'rgba(255, 99, 132, 0.2)', borderColor: 'rgba(255, 99, 132, 1)', borderWidth: 1 },
+            ],
         },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                y: {
-                    beginAtZero: true
-                }
-            }
-        }
+        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } },
     });
 }
 
-// Load products
+// ------------------------------------------------------------------ products
+
 async function loadProducts() {
     try {
-        const response = await fetch(`${API_BASE.inventory}/inventory/products`);
-        products = await response.json();
-        
-        // Initialize filtered products
-        filteredProducts = [...products];
-        
-        // Apply current filters and sorting
-        applyFiltersAndSort();
-        
+        state.products = await api(`${API.inventory}/products`);
+        renderProducts();
     } catch (error) {
-        console.error('Error loading products:', error);
-        showAlert('Error loading products', 'danger');
+        $('products-table').replaceChildren(messageRow(8, `Error loading products: ${error.message}`, 'text-danger'));
     }
 }
 
-// Apply filters and sorting, then render
-function applyFiltersAndSort() {
-    let filtered = [...products];
-    
-    // Apply status filter
-    const statusFilter = document.getElementById('status-filter')?.value || 'all';
-    if (statusFilter !== 'all') {
-        filtered = filtered.filter(product => {
-            const stock = product.stock || 0;
-            const safetyStock = product.safety_stock || 0;
-            
-            if (statusFilter === 'in-stock') {
-                // In Stock: 庫存充足 (庫存 > 安全庫存)
-                return stock > safetyStock;
-            } else if (statusFilter === 'low-stock') {
-                // Low Stock: 庫存不足但還有庫存 (0 < 庫存 <= 安全庫存)
-                return stock > 0 && stock <= safetyStock;
-            } else if (statusFilter === 'out-of-stock') {
-                // Out of Stock: 沒有庫存 (庫存 = 0)
-                return stock === 0;
-            }
-            return true;
+function visibleProducts() {
+    const filter = $('status-filter').value;
+    const term = $('product-search').value.trim().toLowerCase();
+    let list = state.products.filter(p => {
+        const status = stockStatus(p).text;
+        if (filter === 'in-stock' && status !== 'In Stock') return false;
+        if (filter === 'low-stock' && status !== 'Low Stock') return false;
+        if (filter === 'out-of-stock' && status !== 'Out of Stock') return false;
+        return !term || p.sku.toLowerCase().includes(term) || p.name.toLowerCase().includes(term);
+    });
+    const { field, direction } = state.sort;
+    if (field && direction !== 'default') {
+        const value = p => field === 'price' ? Number(p.price) : String(p[field] || '').toLowerCase();
+        list = [...list].sort((a, b) => {
+            const cmp = value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0;
+            return direction === 'asc' ? cmp : -cmp;
         });
     }
-    
-    // Apply search filter
-    const searchTerm = document.getElementById('product-search')?.value?.toLowerCase() || '';
-    if (searchTerm) {
-        filtered = filtered.filter(product => 
-            product.sku.toLowerCase().includes(searchTerm) ||
-            product.name.toLowerCase().includes(searchTerm)
-        );
+    return list;
+}
+
+function renderProducts() {
+    const list = visibleProducts();
+    if (!list.length) {
+        $('products-table').replaceChildren(messageRow(8, 'No products found'));
+        return;
     }
-    
-    // Apply sorting
-    if (currentSort.field && currentSort.direction !== 'default') {
-        filtered.sort((a, b) => {
-            let aVal = a[currentSort.field];
-            let bVal = b[currentSort.field];
-            
-            // Handle different data types
-            if (currentSort.field === 'price') {
-                aVal = parseFloat(aVal) || 0;
-                bVal = parseFloat(bVal) || 0;
-            } else {
-                aVal = String(aVal || '').toLowerCase();
-                bVal = String(bVal || '').toLowerCase();
-            }
-            
-            if (aVal < bVal) return currentSort.direction === 'asc' ? -1 : 1;
-            if (aVal > bVal) return currentSort.direction === 'asc' ? 1 : -1;
-            return 0;
-        });
-    }
-    
-    filteredProducts = filtered;
+    $('products-table').replaceChildren(...list.map((p, index) => {
+        const status = stockStatus(p);
+        return h('tr', {},
+            h('td', {}, index + 1),
+            h('td', {}, p.sku),
+            h('td', {}, p.name),
+            h('td', {}, money(p.price)),
+            h('td', { class: status.cls }, p.stock || 0),
+            h('td', {}, p.safety_stock || 0),
+            h('td', {}, h('span', { class: `badge ${status.badge}` }, status.text)),
+            h('td', {},
+                h('button', { class: 'btn btn-sm btn-outline-primary staff-only', title: 'Edit',
+                              onclick: () => editProduct(p.id) }, icon('fa-edit')),
+                ' ',
+                h('button', { class: 'btn btn-sm btn-outline-danger staff-only', title: 'Delete',
+                              onclick: () => deleteProduct(p.id) }, icon('fa-trash'))));
+    }));
+}
+
+function sortProducts(field) {
+    const s = state.sort;
+    if (s.field !== field) Object.assign(s, { field, direction: 'asc' });
+    else if (s.direction === 'asc') s.direction = 'desc';
+    else Object.assign(s, { field: null, direction: 'default' });
+    ['sku', 'name', 'price'].forEach(f => {
+        $(`sort-${f}-icon`).className = s.field !== f ? 'fas fa-minus'
+            : s.direction === 'asc' ? 'fas fa-sort-up' : 'fas fa-sort-down';
+    });
     renderProducts();
 }
 
-// Render products table
-function renderProducts() {
-        const tbody = document.getElementById('products-table');
-    if (filteredProducts.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">No products found</td></tr>';
-            return;
-        }
-
-        let html = '';
-    filteredProducts.forEach((product, index) => {
-        const stock = product.stock || 0;
-        const safetyStock = product.safety_stock || 0;
-        
-        let statusClass = '';
-        let statusText = '';
-        
-        if (stock === 0) {
-            statusClass = 'bg-danger';
-            statusText = 'Out of Stock';
-        } else if (stock <= safetyStock) {
-            statusClass = 'bg-warning';
-            statusText = 'Low Stock';
-        } else {
-            statusClass = 'bg-success';
-            statusText = 'In Stock';
-        }
-            
-            html += `
-                <tr>
-                <td>${index + 1}</td>
-                    <td>${product.sku}</td>
-                    <td>${product.name}</td>
-                    <td>$${product.price}</td>
-                <td class="${stock === 0 ? 'text-danger' : (stock <= safetyStock ? 'text-warning' : '')}">${product.stock || 0}</td>
-                    <td>${product.safety_stock || 0}</td>
-                <td><span class="badge ${statusClass}">${statusText}</span></td>
-                    <td>
-                        <button class="btn btn-sm btn-outline-primary" onclick="editProduct(${product.id})">
-                            <i class="fas fa-edit"></i>
-                        </button>
-                        <button class="btn btn-sm btn-outline-danger" onclick="deleteProduct(${product.id})">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </td>
-                </tr>
-            `;
-        });
-        
-        tbody.innerHTML = html;
-}
-
-// Sort products
-function sortProducts(field) {
-    if (currentSort.field === field) {
-        // Cycle through: default -> asc -> desc -> default
-        if (currentSort.direction === 'asc') {
-            currentSort.direction = 'desc';
-        } else if (currentSort.direction === 'desc') {
-            currentSort.field = null;
-            currentSort.direction = 'default';
-        }
-    } else {
-        // New field, start with ascending
-        currentSort.field = field;
-        currentSort.direction = 'asc';
-    }
-    
-    // Update sort icons
-    updateSortIcons();
-    
-    // Apply sorting
-    applyFiltersAndSort();
-}
-
-// Update sort icons
-function updateSortIcons() {
-    // Reset all icons to default (minus)
-    document.querySelectorAll('[id$="-icon"]').forEach(icon => {
-        icon.className = 'fas fa-minus';
-    });
-    
-    // Set current sort icon
-    if (currentSort.field && currentSort.direction !== 'default') {
-        const icon = document.getElementById(`sort-${currentSort.field}-icon`);
-        if (icon) {
-            if (currentSort.direction === 'asc') {
-                icon.className = 'fas fa-sort-up';
-            } else if (currentSort.direction === 'desc') {
-                icon.className = 'fas fa-sort-down';
-            }
-        }
-    }
-}
-
-// Filter products by status
-function filterProducts() {
-    applyFiltersAndSort();
-}
-
-// Search products
-function searchProducts() {
-    applyFiltersAndSort();
-}
-
-// Load orders
-async function loadOrders() {
-    try {
-        const response = await fetch(`${API_BASE.orders}/orders/`);
-        orders = await response.json();
-        
-        const tbody = document.getElementById('orders-table');
-        if (orders.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No orders found</td></tr>';
-            return;
-        }
-
-        let html = '';
-        orders.forEach((order, index) => {
-            const statusClass = getStatusClass(order.status);
-            const createdDate = new Date(order.created_at).toLocaleDateString();
-            
-            html += `
-                <tr>
-                    <td>${index + 1}</td>
-                    <td>${order.customer_name}</td>
-                    <td><span class="badge ${statusClass}">${order.status}</span></td>
-                    <td>$${order.total}</td>
-                    <td>${createdDate}</td>
-                    <td>
-                        <button class="btn btn-sm btn-outline-primary" onclick="viewOrder(${order.id})">
-                            <i class="fas fa-eye"></i>
-                        </button>
-                        <button class="btn btn-sm btn-outline-success" onclick="updateOrderStatus(${order.id})">
-                            <i class="fas fa-edit"></i>
-                        </button>
-                        <button class="btn btn-sm btn-outline-danger" onclick="deleteOrder(${order.id})">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </td>
-                </tr>
-            `;
-        });
-        
-        tbody.innerHTML = html;
-    } catch (error) {
-        console.error('Error loading orders:', error);
-        showAlert('Error loading orders', 'danger');
-    }
-}
-
-// Load inventory
-async function loadInventory() {
-    try {
-        const response = await fetch(`${API_BASE.inventory}/inventory/products`);
-        inventoryData = await response.json();
-        
-        // Update product select options
-        updateProductSelects();
-        
-        // Load stock levels
-        loadStockLevels();
-    } catch (error) {
-        console.error('Error loading inventory:', error);
-        showAlert('Error loading inventory', 'danger');
-    }
-}
-
-// Update product select options
-function updateProductSelects() {
-    const selects = document.querySelectorAll('.product-select');
-    selects.forEach(select => {
-        select.innerHTML = '<option value="">Select Product...</option>';
-        inventoryData.forEach(product => {
-            select.innerHTML += `<option value="${product.id}">${product.name} (${product.sku})</option>`;
-        });
-    });
-}
-
-// Load stock levels
-function loadStockLevels() {
-    const container = document.getElementById('stock-levels');
-    
-    if (inventoryData.length === 0) {
-        container.innerHTML = '<div class="text-center text-muted">No inventory data</div>';
-        return;
-    }
-
-    let html = '';
-    inventoryData.forEach(product => {
-        const statusClass = (product.stock || 0) <= (product.safety_stock || 0) ? 'low-stock' : '';
-        html += `
-            <div class="d-flex justify-content-between align-items-center mb-2">
-                <span>${product.name}</span>
-                <span class="${statusClass}">${product.stock || 0} / ${product.safety_stock || 0}</span>
-            </div>
-        `;
-    });
-    
-    container.innerHTML = html;
-}
-
-// Show add product modal
-function showAddProductModal() {
-    const modal = new bootstrap.Modal(document.getElementById('addProductModal'));
-    modal.show();
-}
-
-// Add product
 async function addProduct() {
-    const form = document.getElementById('add-product-form');
-    const formData = new FormData(form);
-    
-    const productData = {
-        sku: document.getElementById('product-sku').value,
-        name: document.getElementById('product-name').value,
-        price: parseFloat(document.getElementById('product-price').value),
-        safety_stock: parseInt(document.getElementById('product-safety-stock').value),
-        stock: parseInt(document.getElementById('product-stock').value)
-    };
-
+    const form = $('add-product-form');
+    if (!form.reportValidity()) return;
     try {
-        const response = await fetch(`${API_BASE.inventory}/inventory/products`, {
+        await api(`${API.inventory}/products`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
+            body: {
+                sku: $('product-sku').value,
+                name: $('product-name').value,
+                price: $('product-price').value,  // sent as a string: exact decimal on the server
+                safety_stock: Number.parseInt($('product-safety-stock').value, 10),
+                stock: Number.parseInt($('product-stock').value, 10),
             },
-            body: JSON.stringify(productData)
         });
-
-        if (response.ok) {
-            showAlert('Product added successfully', 'success');
-            bootstrap.Modal.getInstance(document.getElementById('addProductModal')).hide();
-            form.reset();
-            loadProducts();
-            loadInventory();
-        } else {
-            const error = await response.json();
-            showAlert(`Error: ${error.detail || 'Failed to add product'}`, 'danger');
-        }
+        modal('addProductModal').hide();
+        form.reset();
+        showAlert('Product added', 'success');
+        loadProducts();
     } catch (error) {
-        console.error('Error adding product:', error);
-        showAlert('Error adding product', 'danger');
+        showAlert(`Error: ${error.message}`, 'danger');
     }
 }
 
-// Show create order modal
-function showCreateOrderModal() {
-    const modal = new bootstrap.Modal(document.getElementById('createOrderModal'));
-    modal.show();
-    updateProductSelects();
-}
-
-// Add order item
-function addOrderItem() {
-    const container = document.getElementById('order-items');
-    const newItem = document.createElement('div');
-    newItem.className = 'row mb-2';
-    newItem.innerHTML = `
-        <div class="col-md-6">
-            <select class="form-select product-select" required>
-                <option value="">Select Product...</option>
-            </select>
-        </div>
-        <div class="col-md-4">
-            <input type="number" class="form-control quantity-input" placeholder="Quantity" min="1" required>
-        </div>
-        <div class="col-md-2">
-            <button type="button" class="btn btn-danger btn-sm" onclick="removeOrderItem(this)">
-                <i class="fas fa-trash"></i>
-            </button>
-        </div>
-    `;
-    container.appendChild(newItem);
-    updateProductSelects();
-}
-
-// Remove order item
-function removeOrderItem(button) {
-    button.closest('.row').remove();
-}
-
-// Create order
-async function createOrder() {
-    const form = document.getElementById('create-order-form');
-    const items = [];
-    
-    // Collect order items
-    document.querySelectorAll('#order-items .row').forEach(row => {
-        const productSelect = row.querySelector('.product-select');
-        const quantityInput = row.querySelector('.quantity-input');
-        
-        if (productSelect.value && quantityInput.value) {
-            items.push({
-                product_id: parseInt(productSelect.value),
-                qty: parseInt(quantityInput.value)
-            });
-        }
-    });
-
-    if (items.length === 0) {
-        showAlert('Please add at least one item to the order', 'warning');
-        return;
-    }
-
-    const orderData = {
-        items: items,
-        customer_name: document.getElementById('customer-name').value,
-        customer_email: document.getElementById('customer-email').value,
-        shipping_address: document.getElementById('shipping-address').value,
-        notes: document.getElementById('order-notes').value
-    };
-
-    try {
-        const response = await fetch(`${API_BASE.orders}/orders/`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(orderData)
-        });
-
-        if (response.ok) {
-            showAlert('Order created successfully', 'success');
-            bootstrap.Modal.getInstance(document.getElementById('createOrderModal')).hide();
-            form.reset();
-            document.getElementById('order-items').innerHTML = `
-                <div class="row mb-2">
-                    <div class="col-md-6">
-                        <select class="form-select product-select" required>
-                            <option value="">Select Product...</option>
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <input type="number" class="form-control quantity-input" placeholder="Quantity" min="1" required>
-                    </div>
-                    <div class="col-md-2">
-                        <button type="button" class="btn btn-danger btn-sm" onclick="removeOrderItem(this)">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
-                </div>
-            `;
-            loadOrders();
-        } else {
-            const error = await response.json();
-            showAlert(`Error: ${error.detail || 'Failed to create order'}`, 'danger');
-        }
-    } catch (error) {
-        console.error('Error creating order:', error);
-        showAlert('Error creating order', 'danger');
-    }
-}
-
-// Stock adjustment form submission
-document.getElementById('stock-adjustment-form').addEventListener('submit', async function(e) {
-    e.preventDefault();
-    
-    const productId = document.getElementById('product-select').value;
-    const adjustmentValue = document.getElementById('adjustment-amount').value;
-    const adjustment = parseInt(adjustmentValue);
-    
-    if (!productId || !adjustmentValue || isNaN(adjustment)) {
-        showAlert('Please select a product and enter a valid adjustment amount', 'warning');
-        return;
-    }
-
-    try {
-        const response = await fetch(`${API_BASE.inventory}/inventory/stock/${productId}/adjust`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ adjustment: adjustment })
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            showAlert(`Stock adjusted successfully. New stock level: ${result.current_stock}`, 'success');
-            loadInventory();
-            loadProducts();
-        } else {
-            const error = await response.json();
-            showAlert(`Error: ${error.detail || 'Failed to adjust stock'}`, 'danger');
-        }
-    } catch (error) {
-        console.error('Error adjusting stock:', error);
-        showAlert('Error adjusting stock', 'danger');
-    }
-});
-
-// Helper functions
-function getStatusClass(status) {
-    switch (status) {
-        case 'CREATED': return 'bg-primary';
-        case 'PAID': return 'bg-success';
-        case 'SHIPPED': return 'bg-info';
-        case 'CANCELLED': return 'bg-danger';
-        default: return 'bg-secondary';
-    }
-}
-
-function showAlert(message, type) {
-    const alertDiv = document.createElement('div');
-    alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
-    alertDiv.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
-    alertDiv.innerHTML = `
-        ${message}
-        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-    `;
-    
-    document.body.appendChild(alertDiv);
-    
-    // Auto remove after 5 seconds
-    setTimeout(() => {
-        if (alertDiv.parentNode) {
-            alertDiv.parentNode.removeChild(alertDiv);
-        }
-    }, 5000);
-}
-
-function refreshDashboard() {
-    loadDashboardData();
-}
-
-// Show edit product modal
 function editProduct(id) {
-    // 找到要編輯的產品
-    const product = products.find(p => p.id === id);
-    if (!product) {
-        showAlert('Product not found', 'danger');
-        return;
-    }
-
-    // 填充表單數據
-    document.getElementById('edit-product-id').value = product.id;
-    document.getElementById('edit-product-sku').value = product.sku;
-    document.getElementById('edit-product-name').value = product.name;
-    document.getElementById('edit-product-price').value = product.price;
-    document.getElementById('edit-product-safety-stock').value = product.safety_stock;
-
-    // 顯示模態框
-    const modal = new bootstrap.Modal(document.getElementById('editProductModal'));
-    modal.show();
+    const p = state.products.find(x => x.id === id);
+    if (!p) return showAlert('Product not found', 'danger');
+    $('edit-product-id').value = p.id;
+    $('edit-product-sku').value = p.sku;
+    $('edit-product-name').value = p.name;
+    $('edit-product-price').value = p.price;
+    $('edit-product-safety-stock').value = p.safety_stock;
+    modal('editProductModal').show();
 }
 
-// Update product
 async function updateProduct() {
-    const productId = document.getElementById('edit-product-id').value;
-    const productData = {
-        name: document.getElementById('edit-product-name').value,
-        price: parseFloat(document.getElementById('edit-product-price').value),
-        safety_stock: parseInt(document.getElementById('edit-product-safety-stock').value)
-    };
-
+    if (!$('edit-product-form').reportValidity()) return;
     try {
-        const response = await fetch(`${API_BASE.inventory}/inventory/products/${productId}`, {
+        await api(`${API.inventory}/products/${encodeURIComponent($('edit-product-id').value)}`, {
             method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
+            body: {
+                name: $('edit-product-name').value,
+                price: $('edit-product-price').value,
+                safety_stock: Number.parseInt($('edit-product-safety-stock').value, 10),
             },
-            body: JSON.stringify(productData)
         });
-
-        if (response.ok) {
-            showAlert('Product updated successfully', 'success');
-            bootstrap.Modal.getInstance(document.getElementById('editProductModal')).hide();
-            loadProducts();
-            loadInventory();
-            loadDashboardData(); // 刷新儀表板數據
-        } else {
-            const error = await response.json();
-            showAlert(`Error: ${error.detail || 'Failed to update product'}`, 'danger');
-        }
+        modal('editProductModal').hide();
+        showAlert('Product updated', 'success');
+        loadProducts();
     } catch (error) {
-        console.error('Error updating product:', error);
-        showAlert('Error updating product', 'danger');
+        showAlert(`Error: ${error.message}`, 'danger');
     }
 }
 
 async function deleteProduct(id) {
-    if (confirm('Are you sure you want to delete this product?')) {
-        try {
-            const response = await fetch(`${API_BASE.inventory}/inventory/products/${id}`, {
-                method: 'DELETE'
-            });
-
-            if (response.ok) {
-                showAlert('Product deleted successfully', 'success');
-                loadProducts();
-                loadInventory();
-                loadDashboardData(); // 刷新儀表板數據
-            } else {
-                const error = await response.json();
-                showAlert(`Error: ${error.detail || 'Failed to delete product'}`, 'danger');
-            }
-        } catch (error) {
-            console.error('Error deleting product:', error);
-            showAlert('Error deleting product', 'danger');
-        }
+    if (!confirm('Delete this product?')) return;
+    try {
+        await api(`${API.inventory}/products/${id}`, { method: 'DELETE' });
+        showAlert('Product deleted', 'success');
+        loadProducts();
+    } catch (error) {
+        showAlert(`Error: ${error.message}`, 'danger');
     }
 }
 
-// Delete order
-async function deleteOrder(id) {
-    if (confirm('Are you sure you want to delete this order? This action cannot be undone.')) {
-        try {
-            const response = await fetch(`${API_BASE.orders}/orders/${id}/delete`, {
-                method: 'DELETE'
-            });
+// ------------------------------------------------------------------ inventory
 
-            if (response.ok) {
-                showAlert('Order deleted successfully', 'success');
-                loadOrders();
-                loadDashboardData(); // 刷新儀表板數據
-            } else {
-                const error = await response.json();
-                showAlert(`Error: ${error.detail || 'Failed to delete order'}`, 'danger');
-            }
-        } catch (error) {
-            console.error('Error deleting order:', error);
-            showAlert('Error deleting order', 'danger');
-        }
+function fillProductSelects(products) {
+    document.querySelectorAll('.product-select').forEach(select => {
+        const current = select.value;
+        select.replaceChildren(new Option('Select product...', ''),
+            ...products.map(p => new Option(`${p.name} (${p.sku}) — stock ${p.stock}`, String(p.id))));
+        select.value = current;
+    });
+}
+
+async function loadInventory() {
+    try {
+        state.products = await api(`${API.inventory}/products`);
+        fillProductSelects(state.products);
+        $('stock-levels').replaceChildren(...(state.products.length ? state.products.map(p =>
+            h('div', { class: 'd-flex justify-content-between align-items-center mb-2' },
+                h('span', {}, p.name),
+                h('span', { class: stockStatus(p).cls }, `${p.stock || 0} / ${p.safety_stock || 0}`)))
+            : [h('div', { class: 'text-center text-muted' }, 'No inventory data')]));
+    } catch (error) {
+        $('stock-levels').replaceChildren(h('div', { class: 'text-danger' }, `Error: ${error.message}`));
     }
 }
 
-// View order details
+async function adjustStock(event) {
+    event.preventDefault();
+    const productId = $('product-select').value;
+    const adjustment = Number.parseInt($('adjustment-amount').value, 10);
+    if (!productId || !Number.isInteger(adjustment) || adjustment === 0) {
+        return showAlert('Select a product and enter a non-zero whole number', 'warning');
+    }
+    try {
+        const result = await api(`${API.inventory}/stock/${encodeURIComponent(productId)}/adjust`,
+            { method: 'POST', body: { adjustment } });
+        showAlert(`Stock adjusted. New level: ${result.current_stock}`, 'success');
+        $('adjustment-amount').value = '';
+        loadInventory();
+    } catch (error) {
+        showAlert(`Error: ${error.message}`, 'danger');
+    }
+}
+
+// ------------------------------------------------------------------ orders
+
+const STATUS_BADGE = {
+    PENDING: 'bg-secondary', CREATED: 'bg-primary', PAID: 'bg-success', SHIPPED: 'bg-info',
+    CANCELLED: 'bg-danger', REFUNDED: 'bg-warning', FAILED: 'bg-dark',
+};
+
+function statusBadge(order) {
+    const badge = h('span', { class: `badge ${STATUS_BADGE[order.status] || 'bg-secondary'}` }, order.status);
+    if (!/_PENDING$/.test(order.inventory_sync || '')) return badge;
+    return h('span', {}, badge, ' ', h('span', { class: 'badge bg-light text-dark', title: 'Stock update pending; it is retried automatically' },
+        icon('fa-clock'), ' stock sync'));
+}
+
+async function loadOrders() {
+    try {
+        const page = await api(`${API.orders}?skip=${state.ordersSkip}&limit=${ORDERS_PAGE_SIZE}`);
+        state.ordersTotal = page.total;
+        const rows = page.items.map(o => h('tr', {},
+            h('td', {}, o.id),
+            h('td', {}, o.customer_name || '—'),
+            h('td', {}, statusBadge(o)),
+            h('td', {}, money(o.total)),
+            h('td', {}, dateTime(o.created_at)),
+            h('td', {},
+                h('button', { class: 'btn btn-sm btn-outline-primary', title: 'View', onclick: () => viewOrder(o.id) }, icon('fa-eye')),
+                ' ',
+                h('button', { class: 'btn btn-sm btn-outline-success staff-only', title: 'Change status',
+                              onclick: () => openStatusModal(o.id) }, icon('fa-edit')),
+                ' ',
+                h('button', { class: 'btn btn-sm btn-outline-danger staff-only', title: 'Delete (closed orders only)',
+                              onclick: () => deleteOrder(o.id) }, icon('fa-trash')))));
+        $('orders-table').replaceChildren(...(rows.length ? rows : [messageRow(6, 'No orders found')]));
+        const first = page.total ? page.skip + 1 : 0;
+        setText('orders-page-info', `Showing ${first}-${page.skip + page.items.length} of ${page.total}`);
+        $('orders-prev').disabled = page.skip === 0;
+        $('orders-next').disabled = page.skip + page.items.length >= page.total;
+    } catch (error) {
+        $('orders-table').replaceChildren(messageRow(6, `Error loading orders: ${error.message}`, 'text-danger'));
+        setText('orders-page-info', '');
+    }
+}
+
+function orderItemRow() {
+    return h('div', { class: 'row mb-2 order-item-row' },
+        h('div', { class: 'col-md-6' }, h('select', { class: 'form-select product-select', required: true })),
+        h('div', { class: 'col-md-4' }, h('input', { type: 'number', class: 'form-control quantity-input',
+                                                      placeholder: 'Quantity', min: 1, step: 1, required: true })),
+        h('div', { class: 'col-md-2' }, h('button', { type: 'button', class: 'btn btn-danger btn-sm',
+                                                       onclick: e => e.currentTarget.closest('.row').remove() },
+            icon('fa-trash'))));
+}
+
+async function openCreateOrder() {
+    $('create-order-form').reset();
+    $('order-items').replaceChildren(orderItemRow());
+    state.orderIdempotencyKey = newKey();  // one key per order attempt; reused on retries
+    modal('createOrderModal').show();
+    try {
+        state.products = await api(`${API.inventory}/products`);
+        fillProductSelects(state.products);
+    } catch (error) {
+        showAlert(`Error loading products: ${error.message}`, 'danger');
+    }
+}
+
+function addOrderItem() {
+    $('order-items').append(orderItemRow());
+    fillProductSelects(state.products);
+}
+
+async function createOrder() {
+    const form = $('create-order-form');
+    if (!form.reportValidity()) return;
+    const items = [...document.querySelectorAll('#order-items .order-item-row')].map(row => ({
+        product_id: Number.parseInt(row.querySelector('.product-select').value, 10),
+        qty: Number.parseInt(row.querySelector('.quantity-input').value, 10),
+    })).filter(i => Number.isInteger(i.product_id) && Number.isInteger(i.qty));
+    if (!items.length) return showAlert('Add at least one item', 'warning');
+
+    try {
+        await api(API.orders, {
+            method: 'POST',
+            headers: { 'Idempotency-Key': state.orderIdempotencyKey },
+            body: {
+                items,
+                customer_name: $('customer-name').value,
+                customer_email: $('customer-email').value,
+                shipping_address: $('shipping-address').value,
+                notes: $('order-notes').value || null,
+            },
+        });
+        modal('createOrderModal').hide();
+        showAlert('Order created', 'success');
+        loadOrders();
+    } catch (error) {
+        // Unknown outcome (5xx/network): keep the key so a retry cannot double-book.
+        // Definite rejection (4xx): the next attempt is a new request.
+        if (error.status && error.status < 500) state.orderIdempotencyKey = newKey();
+        showAlert(`Error: ${error.message}`, 'danger');
+    }
+}
+
+function detailTable(rows) {
+    return h('table', { class: 'table table-sm' },
+        h('tbody', {}, rows.filter(Boolean).map(([label, value]) => h('tr', {}, h('td', {}, h('strong', {}, label)), h('td', {}, value)))));
+}
+
 async function viewOrder(id) {
     try {
-        const response = await fetch(`${API_BASE.orders}/orders/${id}`);
-        if (!response.ok) {
-            throw new Error('Failed to fetch order details');
-        }
-        
-        const order = await response.json();
-        
-        // Display order details
-        const orderDetails = document.getElementById('order-details');
-        orderDetails.innerHTML = `
-            <div class="row">
-                <div class="col-md-6">
-                    <h6>Order Information</h6>
-                    <table class="table table-sm">
-                        <tr>
-                            <td><strong>Order ID:</strong></td>
-                            <td>#${order.id}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Status:</strong></td>
-                            <td><span class="badge ${getStatusClass(order.status)}">${order.status}</span></td>
-                        </tr>
-                        <tr>
-                            <td><strong>Total:</strong></td>
-                            <td>$${order.total}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Created:</strong></td>
-                            <td>${new Date(order.created_at).toLocaleString()}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Updated:</strong></td>
-                            <td>${new Date(order.updated_at).toLocaleString()}</td>
-                        </tr>
-                        ${order.paid_at ? `
-                        <tr>
-                            <td><strong>Paid:</strong></td>
-                            <td>${new Date(order.paid_at).toLocaleString()}</td>
-                        </tr>
-                        ` : ''}
-                        ${order.shipped_at ? `
-                        <tr>
-                            <td><strong>Shipped:</strong></td>
-                            <td>${new Date(order.shipped_at).toLocaleString()}</td>
-                        </tr>
-                        ` : ''}
-                    </table>
-                </div>
-                <div class="col-md-6">
-                    <h6>Customer Information</h6>
-                    <table class="table table-sm">
-                        <tr>
-                            <td><strong>Name:</strong></td>
-                            <td>${order.customer_name}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Email:</strong></td>
-                            <td>${order.customer_email}</td>
-                        </tr>
-                        <tr>
-                            <td><strong>Address:</strong></td>
-                            <td>${order.shipping_address || 'N/A'}</td>
-                        </tr>
-                    </table>
-                </div>
-            </div>
-            
-            ${order.notes ? `
-            <div class="mt-3">
-                <h6>Notes</h6>
-                <div class="alert alert-info">
-                    <pre style="white-space: pre-wrap; margin: 0;">${order.notes}</pre>
-                </div>
-            </div>
-            ` : ''}
-            
-            <div class="mt-3">
-                <h6>Order Items</h6>
-                <div class="table-responsive">
-                    <table class="table table-sm">
-                        <thead>
-                            <tr>
-                                <th>Product</th>
-                                <th>SKU</th>
-                                <th>Qty</th>
-                                <th>Unit Price</th>
-                                <th>Subtotal</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${order.items.map(item => `
-                                <tr>
-                                    <td>${item.product_name}</td>
-                                    <td>${item.product_sku}</td>
-                                    <td>${item.qty}</td>
-                                    <td>$${item.unit_price}</td>
-                                    <td>$${item.subtotal}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                        <tfoot>
-                            <tr class="table-active">
-                                <th colspan="4">Total</th>
-                                <th>$${order.total}</th>
-                            </tr>
-                        </tfoot>
-                    </table>
-                </div>
-            </div>
-        `;
-        
-        // Show modal
-        const modal = new bootstrap.Modal(document.getElementById('viewOrderModal'));
-        modal.show();
-        
+        const o = await api(`${API.orders}/${id}`);
+        const itemRows = o.items.map(i => h('tr', {},
+            h('td', {}, i.product_name), h('td', {}, i.product_sku), h('td', {}, i.qty),
+            h('td', {}, money(i.unit_price)), h('td', {}, money(i.subtotal))));
+        $('order-details').replaceChildren(
+            h('div', { class: 'row' },
+                h('div', { class: 'col-md-6' }, h('h6', {}, 'Order Information'), detailTable([
+                    ['Order ID:', `#${o.id}`],
+                    ['Status:', statusBadge(o)],
+                    ['Total:', money(o.total)],
+                    ['Created:', dateTime(o.created_at)],
+                    ['Updated:', dateTime(o.updated_at)],
+                    o.paid_at && ['Paid:', dateTime(o.paid_at)],
+                    o.shipped_at && ['Shipped:', dateTime(o.shipped_at)],
+                    ['Stock:', o.sync_error ? `${o.inventory_sync} (${o.sync_error})` : o.inventory_sync],
+                ])),
+                h('div', { class: 'col-md-6' }, h('h6', {}, 'Customer Information'), detailTable([
+                    ['Name:', o.customer_name || '—'],
+                    ['Email:', o.customer_email || '—'],
+                    ['Address:', h('span', { class: 'preserve-lines' }, o.shipping_address || '—')],
+                ]))),
+            o.notes ? h('div', { class: 'mt-3' }, h('h6', {}, 'Notes'),
+                h('div', { class: 'alert alert-info' }, h('pre', { class: 'preserve-lines' }, o.notes))) : null,
+            h('div', { class: 'mt-3' }, h('h6', {}, 'Order Items'),
+                h('div', { class: 'table-responsive' }, h('table', { class: 'table table-sm' },
+                    h('thead', {}, h('tr', {}, ['Product', 'SKU', 'Qty', 'Unit Price', 'Subtotal'].map(t => h('th', {}, t)))),
+                    h('tbody', {}, itemRows),
+                    h('tfoot', {}, h('tr', { class: 'table-active' }, h('th', { colspan: 4 }, 'Total'), h('th', {}, money(o.total))))))));
+        modal('viewOrderModal').show();
     } catch (error) {
-        console.error('Error loading order details:', error);
-        showAlert('Error loading order details', 'danger');
+        showAlert(`Error loading order: ${error.message}`, 'danger');
     }
 }
 
-// Update order status
-async function updateOrderStatus(id) {
+const STATUS_HELP = {
+    PAID: 'Marks the order as paid. Stock stays reserved.',
+    SHIPPED: 'Goods leave the warehouse; the stock reservation becomes final.',
+    CANCELLED: 'Cancels an unpaid order and returns its stock (once).',
+    REFUNDED: 'Before shipping: returns stock. After shipping: money only; restock returned goods manually.',
+};
+
+async function openStatusModal(id) {
     try {
-        // Get current order details
-        const response = await fetch(`${API_BASE.orders}/orders/${id}`);
-        if (!response.ok) {
-            throw new Error('Failed to fetch order details');
-        }
-        
-        const order = await response.json();
-        
-        // Get valid transitions for current status
-        const workflowResponse = await fetch(`${API_BASE.orders}/orders/${id}/workflow`);
-        if (!workflowResponse.ok) {
-            throw new Error('Failed to fetch workflow information');
-        }
-        
-        const workflow = await workflowResponse.json();
-        
-        // Populate form
-        document.getElementById('update-order-id').value = order.id;
-        document.getElementById('current-status').value = order.status;
-        
-        // Populate status options
-        const statusSelect = document.getElementById('new-status');
-        statusSelect.innerHTML = '<option value="">Select new status...</option>';
-        
-        workflow.valid_transitions.forEach(status => {
-            const option = document.createElement('option');
-            option.value = status;
-            option.textContent = status;
-            statusSelect.appendChild(option);
-        });
-        
-        // Show modal
-        const modal = new bootstrap.Modal(document.getElementById('updateOrderStatusModal'));
-        modal.show();
-        
+        const o = await api(`${API.orders}/${id}`);
+        $('update-order-id').value = o.id;
+        $('current-status').value = o.status;
+        $('status-notes').value = '';
+        $('new-status').replaceChildren(new Option('Select new status...', ''),
+            ...o.valid_transitions.map(s => new Option(s, s)));
+        setText('status-help', o.valid_transitions.length ? '' : 'No further status changes are possible.');
+        modal('updateOrderStatusModal').show();
     } catch (error) {
-        console.error('Error loading order status update:', error);
-        showAlert('Error loading order status update', 'danger');
+        showAlert(`Error: ${error.message}`, 'danger');
     }
 }
 
-// Confirm update order status
-async function confirmUpdateOrderStatus() {
-    const orderId = document.getElementById('update-order-id').value;
-    const newStatus = document.getElementById('new-status').value;
-    const notes = document.getElementById('status-notes').value;
-    
-    if (!newStatus) {
-        showAlert('Please select a new status', 'warning');
-        return;
-    }
-    
+async function confirmStatusChange() {
+    const status = $('new-status').value;
+    if (!status) return showAlert('Select a new status', 'warning');
     try {
-        const response = await fetch(`${API_BASE.orders}/orders/${orderId}/status`, {
-            method: 'PATCH',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                status: newStatus,
-                notes: notes || null
-            })
+        const o = await api(`${API.orders}/${encodeURIComponent($('update-order-id').value)}/status`, {
+            method: 'PATCH', body: { status, notes: $('status-notes').value || null },
         });
-        
-        if (response.ok) {
-            showAlert('Order status updated successfully', 'success');
-            bootstrap.Modal.getInstance(document.getElementById('updateOrderStatusModal')).hide();
-            loadOrders(); // Refresh orders list
-        } else {
-            const error = await response.json();
-            showAlert(`Error: ${error.detail || 'Failed to update order status'}`, 'danger');
-        }
+        modal('updateOrderStatusModal').hide();
+        showAlert(o.sync_error ? `Status updated; stock sync pending (${o.sync_error})` : 'Status updated',
+            o.sync_error ? 'warning' : 'success');
+        loadOrders();
     } catch (error) {
-        console.error('Error updating order status:', error);
-        showAlert('Error updating order status', 'danger');
+        showAlert(`Error: ${error.message}`, 'danger');
     }
 }
 
-// ==================== REPORTS FUNCTIONALITY ====================
+async function deleteOrder(id) {
+    if (!confirm('Delete this order permanently? Only cancelled, refunded or failed orders can be deleted.')) return;
+    try {
+        await api(`${API.orders}/${id}`, { method: 'DELETE' });
+        showAlert('Order deleted', 'success');
+        loadOrders();
+    } catch (error) {
+        showAlert(`Error: ${error.message}`, 'danger');
+    }
+}
 
-// Load reports data
+// ------------------------------------------------------------------ reports
+
+function statCard(value, label, cls) {
+    return h('div', { class: 'col-6 mb-3' }, h('div', { class: 'card bg-light' }, h('div', { class: 'card-body text-center' },
+        h('h5', { class: `card-title text-${cls}` }, value), h('p', { class: 'card-text small' }, label))));
+}
+
+function productTable(rows, emptyText, rowClass) {
+    return h('div', { class: 'table-responsive' }, h('table', { class: 'table table-sm' },
+        h('thead', {}, h('tr', {}, ['Product Name', 'SKU', 'Current Stock', 'Safety Stock'].map(t => h('th', {}, t)))),
+        h('tbody', {}, rows.length ? rows.map(p => h('tr', { class: rowClass },
+            h('td', {}, p.name), h('td', {}, p.sku), h('td', {}, p.current_stock), h('td', {}, p.safety_stock)))
+            : messageRow(4, emptyText))));
+}
+
 async function loadReports() {
-    try {
-        // Load both inventory and order reports in parallel
-        await Promise.all([
-            loadInventoryReport(),
-            loadOrderReport()
-        ]);
-    } catch (error) {
-        console.error('Error loading reports:', error);
-        showAlert('Error loading reports', 'danger');
-    }
+    await Promise.all([loadInventoryReport(), loadOrderReport()]);
 }
 
-// Load inventory report
 async function loadInventoryReport() {
     try {
-        const [productsRes, lowStockRes] = await Promise.all([
-            fetch(`${API_BASE.inventory}/inventory/products`),
-            fetch(`${API_BASE.inventory}/inventory/low-stock`)
-        ]);
-
-        const products = await productsRes.json();
-        const lowStockProducts = await lowStockRes.json();
-
-        // Calculate inventory statistics
-        const totalValue = products.reduce((sum, product) => {
-            const stock = product.stock || 0;
-            const price = product.price || 0;
-            return sum + stock * price;
-        }, 0);
-        const totalProducts = products.length;
-        const outOfStockCount = products.filter(p => (p.stock || 0) === 0).length;
-        const lowStockCount = products.filter(p => {
-            const stock = p.stock || 0;
-            const safetyStock = p.safety_stock || 0;
-            return stock > 0 && stock <= safetyStock;
-        }).length;
-        const inStockCount = totalProducts - outOfStockCount - lowStockCount;
-
-        // Calculate inventory turnover (simplified - based on orders)
-        const ordersRes = await fetch(`${API_BASE.orders}/orders/`);
-        const orders = await ordersRes.json();
-        const totalOrderValue = orders.reduce((sum, order) => sum + (order.total || 0), 0);
-        const turnoverRate = totalValue > 0 ? (totalOrderValue / totalValue).toFixed(2) : 0;
-
-        // Generate inventory report HTML
-        const inventoryReport = document.getElementById('inventory-report');
-        inventoryReport.innerHTML = `
-            <div class="row">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Inventory Overview</h6>
-                    <div class="row mb-3">
-                        <div class="col-6">
-                            <div class="card bg-light">
-                                <div class="card-body text-center">
-                                    <h5 class="card-title text-success">$${totalValue.toLocaleString()}</h5>
-                                    <p class="card-text small">Total Inventory Value</p>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="col-6">
-                            <div class="card bg-light">
-                                <div class="card-body text-center">
-                                    <h5 class="card-title text-info">${totalProducts}</h5>
-                                    <p class="card-text small">Total Products</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Inventory Status Distribution</h6>
-                    <div style="height: 300px; position: relative;">
-                        <canvas id="inventoryStatusChart"></canvas>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row mt-3">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Inventory Turnover Rate</h6>
-                    <div class="alert alert-info">
-                        <strong>Turnover Rate:</strong> ${turnoverRate}x
-                        <br><small class="text-muted">Based on Total Order Value / Total Inventory Value</small>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row mt-3">
-                <div class="col-12">
-                    <h6 class="text-danger mb-3">Out of Stock</h6>
-                    <div class="table-responsive">
-                        <table class="table table-sm">
-                            <thead>
-                                <tr>
-                                    <th>Product Name</th>
-                                    <th>SKU</th>
-                                    <th>Current Stock</th>
-                                    <th>Safety Stock</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${lowStockProducts.filter(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    return currentStock === 0;
-                                }).slice(0, 5).map(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    const safetyStock = product.safety_stock || 0;
-                                    
-                                    return `
-                                        <tr class="table-danger">
-                                            <td>${product.name}</td>
-                                            <td>${product.sku}</td>
-                                            <td>${currentStock}</td>
-                                            <td>${safetyStock}</td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                                ${lowStockProducts.filter(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    return currentStock === 0;
-                                }).length === 0 ? `
-                                    <tr>
-                                        <td colspan="4" class="text-center text-muted">No out of stock products</td>
-                                    </tr>
-                                ` : ''}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row mt-3">
-                <div class="col-12">
-                    <h6 class="text-warning mb-3">Low Stock Alerts</h6>
-                    <div class="table-responsive">
-                        <table class="table table-sm">
-                            <thead>
-                                <tr>
-                                    <th>Product Name</th>
-                                    <th>SKU</th>
-                                    <th>Current Stock</th>
-                                    <th>Safety Stock</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${lowStockProducts.filter(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    const safetyStock = product.safety_stock || 0;
-                                    return currentStock > 0 && currentStock <= safetyStock;
-                                }).slice(0, 5).map(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    const safetyStock = product.safety_stock || 0;
-                                    
-                                    return `
-                                        <tr class="table-warning">
-                                            <td>${product.name}</td>
-                                            <td>${product.sku}</td>
-                                            <td>${currentStock}</td>
-                                            <td>${safetyStock}</td>
-                                        </tr>
-                                    `;
-                                }).join('')}
-                                ${lowStockProducts.filter(product => {
-                                    const currentStock = product.current_stock || product.stock || 0;
-                                    const safetyStock = product.safety_stock || 0;
-                                    return currentStock > 0 && currentStock <= safetyStock;
-                                }).length === 0 ? `
-                                    <tr>
-                                        <td colspan="4" class="text-center text-muted">No low stock products</td>
-                                    </tr>
-                                ` : ''}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        // Create inventory status chart
-        createInventoryStatusChart(inStockCount, lowStockCount, outOfStockCount);
-
+        const [stats, lowStock] = await Promise.all([
+            api(`${API.inventory}/stats`), api(`${API.inventory}/low-stock`)]);
+        $('inventory-report').replaceChildren(
+            h('h6', { class: 'text-primary mb-3' }, 'Inventory Overview'),
+            h('div', { class: 'row' },
+                statCard(money(stats.total_value), 'Total Inventory Value', 'success'),
+                statCard(stats.total_products, 'Total Products', 'info')),
+            h('h6', { class: 'text-primary mb-3' }, 'Inventory Status Distribution'),
+            h('div', { class: 'chart-box chart-box-lg' }, h('canvas', { id: 'inventoryStatusChart' })),
+            h('h6', { class: 'text-danger mt-3 mb-3' }, 'Out of Stock'),
+            productTable(lowStock.filter(p => p.current_stock === 0), 'No out of stock products', 'table-danger'),
+            h('h6', { class: 'text-warning mt-3 mb-3' }, 'Low Stock'),
+            productTable(lowStock.filter(p => p.current_stock > 0), 'No low stock products', 'table-warning'));
+        renderChart('inventoryStatus', 'inventoryStatusChart', {
+            type: 'doughnut',
+            data: {
+                labels: ['In Stock', 'Low Stock', 'Out of Stock'],
+                datasets: [{ data: [stats.in_stock, stats.low_stock, stats.out_of_stock],
+                             backgroundColor: ['rgba(40, 167, 69, 0.8)', 'rgba(255, 193, 7, 0.8)', 'rgba(220, 53, 69, 0.8)'] }],
+            },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } },
+        });
     } catch (error) {
-        console.error('Error loading inventory report:', error);
-        document.getElementById('inventory-report').innerHTML = `
-            <div class="alert alert-danger">
-                <i class="fas fa-exclamation-triangle"></i> Error loading inventory report
-            </div>
-        `;
+        $('inventory-report').replaceChildren(h('div', { class: 'alert alert-danger' }, `Error loading inventory report: ${error.message}`));
     }
 }
 
-// Load order report
 async function loadOrderReport() {
     try {
-        const ordersRes = await fetch(`${API_BASE.orders}/orders/`);
-        const orders = await ordersRes.json();
-
-        // Calculate order statistics
-        const totalOrders = orders.length;
-        const totalRevenue = orders.reduce((sum, order) => sum + (order.total || 0), 0);
-        const avgOrderValue = totalOrders > 0 ? (totalRevenue / totalOrders).toFixed(2) : 0;
-
-        // Order status distribution
-        const statusCounts = orders.reduce((acc, order) => {
-            acc[order.status] = (acc[order.status] || 0) + 1;
-            return acc;
-        }, {});
-
-        // Customer statistics
-        const customerOrders = orders.reduce((acc, order) => {
-            const customer = order.customer_name;
-            if (!acc[customer]) {
-                acc[customer] = { count: 0, total: 0 };
-            }
-            acc[customer].count++;
-            acc[customer].total += order.total || 0;
-            return acc;
-        }, {});
-
-        const topCustomers = Object.entries(customerOrders)
-            .sort((a, b) => b[1].total - a[1].total)
-            .slice(0, 5);
-
-        // Generate order report HTML
-        const orderReport = document.getElementById('order-report');
-        orderReport.innerHTML = `
-            <div class="row">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Order Overview</h6>
-                    <div class="row mb-3">
-                        <div class="col-6">
-                            <div class="card bg-light">
-                                <div class="card-body text-center">
-                                    <h5 class="card-title text-success">$${totalRevenue.toLocaleString()}</h5>
-                                    <p class="card-text small">Total Revenue</p>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="col-6">
-                            <div class="card bg-light">
-                                <div class="card-body text-center">
-                                    <h5 class="card-title text-info">${totalOrders}</h5>
-                                    <p class="card-text small">Total Orders</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="row mb-3">
-                        <div class="col-12">
-                            <div class="card bg-light">
-                                <div class="card-body text-center">
-                                    <h5 class="card-title text-warning">$${avgOrderValue}</h5>
-                                    <p class="card-text small">Average Order Value</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Order Status Distribution</h6>
-                    <div style="height: 250px; position: relative;">
-                        <canvas id="orderStatusChart"></canvas>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="row mt-3">
-                <div class="col-12">
-                    <h6 class="text-primary mb-3">Top Customers</h6>
-                    <div class="table-responsive">
-                        <table class="table table-sm">
-                            <thead>
-                                <tr>
-                                    <th>Customer Name</th>
-                                    <th>Order Count</th>
-                                    <th>Total Spent</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${topCustomers.map(([customer, data]) => `
-                                    <tr>
-                                        <td>${customer}</td>
-                                        <td>${data.count}</td>
-                                        <td>$${data.total.toFixed(2)}</td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        // Create order status chart
-        createOrderStatusChart(statusCounts);
-
+        const stats = await api(`${API.orders}/stats`);
+        const statuses = Object.keys(stats.by_status);
+        $('order-report').replaceChildren(
+            h('h6', { class: 'text-primary mb-3' }, `Order Overview (${stats.scope})`),
+            h('div', { class: 'row' },
+                statCard(money(stats.revenue), 'Revenue (paid + shipped)', 'success'),
+                statCard(stats.total_orders, 'Total Orders', 'info'),
+                statCard(money(stats.average_order_value), 'Average Paid Order', 'warning'),
+                statCard(stats.pending_inventory_sync, 'Orders Awaiting Stock Sync', 'secondary')),
+            h('h6', { class: 'text-primary mb-3' }, 'Order Status Distribution'),
+            h('div', { class: 'chart-box chart-box-md' }, h('canvas', { id: 'orderStatusChart' })),
+            h('h6', { class: 'text-primary mt-3 mb-3' }, 'Top Customers (paid + shipped)'),
+            h('div', { class: 'table-responsive' }, h('table', { class: 'table table-sm' },
+                h('thead', {}, h('tr', {}, ['Customer Name', 'Orders', 'Total Spent'].map(t => h('th', {}, t)))),
+                h('tbody', {}, stats.top_customers.length ? stats.top_customers.map(c => h('tr', {},
+                    h('td', {}, c.customer_name), h('td', {}, c.orders), h('td', {}, money(c.total))))
+                    : messageRow(3, 'No paid orders yet')))));
+        renderChart('orderStatus', 'orderStatusChart', {
+            type: 'bar',
+            data: { labels: statuses, datasets: [{ label: 'Orders', data: statuses.map(s => stats.by_status[s]),
+                                                  backgroundColor: 'rgba(54, 162, 235, 0.8)' }] },
+            options: { responsive: true, maintainAspectRatio: false,
+                       scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }, plugins: { legend: { display: false } } },
+        });
     } catch (error) {
-        console.error('Error loading order report:', error);
-        document.getElementById('order-report').innerHTML = `
-            <div class="alert alert-danger">
-                <i class="fas fa-exclamation-triangle"></i> Error loading order report
-            </div>
-        `;
+        $('order-report').replaceChildren(h('div', { class: 'alert alert-danger' }, `Error loading order report: ${error.message}`));
     }
 }
 
-// Create inventory status chart
-function createInventoryStatusChart(inStock, lowStock, outOfStock) {
-    const ctx = document.getElementById('inventoryStatusChart').getContext('2d');
-    
-    // Destroy existing chart if it exists
-    if (charts.inventoryStatus) {
-        charts.inventoryStatus.destroy();
-    }
+// ------------------------------------------------------------------ wiring
 
-    charts.inventoryStatus = new Chart(ctx, {
-        type: 'doughnut',
-        data: {
-            labels: ['In Stock', 'Low Stock', 'Out of Stock'],
-            datasets: [{
-                data: [inStock, lowStock, outOfStock],
-                backgroundColor: [
-                    'rgba(40, 167, 69, 0.8)',
-                    'rgba(255, 193, 7, 0.8)',
-                    'rgba(220, 53, 69, 0.8)'
-                ],
-                borderColor: [
-                    'rgba(40, 167, 69, 1)',
-                    'rgba(255, 193, 7, 1)',
-                    'rgba(220, 53, 69, 1)'
-                ],
-                borderWidth: 2
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    position: 'bottom'
-                }
-            }
-        }
+function bindEvents() {
+    $('login-form').addEventListener('submit', login);
+    $('logout-btn').addEventListener('click', () => logout());
+    document.querySelectorAll('.nav-link[data-section]').forEach(link => link.addEventListener('click', event => {
+        event.preventDefault();
+        showSection(event.currentTarget.dataset.section);
+    }));
+    document.querySelectorAll('[data-sort]').forEach(btn => btn.addEventListener('click', event => {
+        sortProducts(event.currentTarget.dataset.sort);
+    }));
+    $('refresh-dashboard').addEventListener('click', loadDashboard);
+    $('status-filter').addEventListener('change', renderProducts);
+    $('product-search').addEventListener('input', renderProducts);
+    $('add-product-btn').addEventListener('click', () => modal('addProductModal').show());
+    $('add-product-submit').addEventListener('click', addProduct);
+    $('edit-product-submit').addEventListener('click', updateProduct);
+    $('stock-adjustment-form').addEventListener('submit', adjustStock);
+    $('create-order-btn').addEventListener('click', openCreateOrder);
+    $('add-order-item').addEventListener('click', addOrderItem);
+    $('create-order-submit').addEventListener('click', createOrder);
+    $('update-status-submit').addEventListener('click', confirmStatusChange);
+    $('new-status').addEventListener('change', e => setText('status-help', STATUS_HELP[e.target.value] || ''));
+    $('orders-prev').addEventListener('click', () => {
+        state.ordersSkip = Math.max(0, state.ordersSkip - ORDERS_PAGE_SIZE);
+        loadOrders();
+    });
+    $('orders-next').addEventListener('click', () => {
+        state.ordersSkip += ORDERS_PAGE_SIZE;
+        loadOrders();
     });
 }
 
-// Create order status chart
-function createOrderStatusChart(statusCounts) {
-    const ctx = document.getElementById('orderStatusChart').getContext('2d');
-    
-    // Destroy existing chart if it exists
-    if (charts.orderStatus) {
-        charts.orderStatus.destroy();
-    }
-
-    const statusLabels = {
-        'CREATED': 'Created',
-        'PAID': 'Paid',
-        'PICKING': 'Picking',
-        'SHIPPED': 'Shipped',
-        'CANCELLED': 'Cancelled'
-    };
-
-    const labels = Object.keys(statusCounts).map(status => statusLabels[status] || status);
-    const data = Object.values(statusCounts);
-    const colors = [
-        'rgba(54, 162, 235, 0.8)',
-        'rgba(40, 167, 69, 0.8)',
-        'rgba(255, 193, 7, 0.8)',
-        'rgba(23, 162, 184, 0.8)',
-        'rgba(220, 53, 69, 0.8)'
-    ];
-
-    charts.orderStatus = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: labels,
-            datasets: [{
-                label: 'Order Count',
-                data: data,
-                backgroundColor: colors.slice(0, labels.length),
-                borderColor: colors.slice(0, labels.length).map(color => color.replace('0.8', '1')),
-                borderWidth: 1
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                y: {
-                    beginAtZero: true,
-                    ticks: {
-                        stepSize: 1
-                    }
-                }
-            },
-            plugins: {
-                legend: {
-                    display: false
-                }
-            }
-        }
-    });
-}
+document.addEventListener('DOMContentLoaded', () => {
+    bindEvents();
+    state.token = storage.get('token');
+    state.user = storage.get('user');
+    state.role = storage.get('role');
+    applySession();
+    if (state.token) showSection('dashboard');
+});

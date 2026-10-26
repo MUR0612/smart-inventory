@@ -1,75 +1,109 @@
-version: "3.9"
+# Local stack. Only the gateway is published; MySQL, Redis and the two
+# services stay on the internal network. For debugging, add
+#   -f docker-compose.debug.yml   (binds them to 127.0.0.1 only).
+#
+# All credentials come from .env (create it with: python scripts/init_env.py).
+# This is a local HTTP setup; public deployments use HTTPS (see k8s/README.md).
+name: smart-inventory
+
+x-db-env: &db-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: ${DB_NAME:?DB_NAME is not set - run scripts/init_env.py}
+  DB_USER: ${DB_USER:?DB_USER is not set}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is not set}
+
+x-app-env: &app-env
+  <<: *db-env
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is not set}
+  SERVICE_TOKEN: ${SERVICE_TOKEN:?SERVICE_TOKEN is not set}
 
 services:
   mysql:
-    image: mysql:5.7
-    container_name: inv-mysql
+    image: mysql:8.4
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    ports:
-      - "3307:3306"
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is not set}
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./mysql/init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p${MYSQL_ROOT_PASSWORD} --silent"]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 30
 
   redis:
-    image: redis:7
-    container_name: inv-redis
-    ports:
-      - "6379:6379"
+    image: redis:7.4-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-off schema migration + least-privilege app account; apps wait for it.
+  migrate:
+    build:
+      context: .
+      dockerfile: db/Dockerfile
+    environment:
+      <<: *db-env
+      MIGRATE_DB_USER: root
+      MIGRATE_DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
 
   inventory-service:
     build:
-      context: ./inventory-service
-    container_name: inv-inventory
+      context: .
+      dockerfile: inventory-service/Dockerfile
     restart: unless-stopped
     environment:
-      DB_URL: mysql+pymysql://root:rootpassword@mysql:3306/smart_inventory
-      REDIS_HOST: ${REDIS_HOST}
-      REDIS_PORT: ${REDIS_PORT}
+      <<: *app-env
+      AUTH_USERS: ${AUTH_USERS:?AUTH_USERS is not set}
     depends_on:
-      mysql:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_started
-    ports:
-      - "${INVENTORY_PORT}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/inventory/readyz', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
   order-service:
     build:
-      context: ./order-service
-    container_name: inv-order
+      context: .
+      dockerfile: order-service/Dockerfile
     restart: unless-stopped
     environment:
-      DB_URL: mysql+pymysql://root:rootpassword@mysql:3306/smart_inventory
+      <<: *app-env
       INVENTORY_BASE_URL: http://inventory-service:8001
     depends_on:
-      mysql:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       inventory-service:
         condition: service_started
-    ports:
-      - "${ORDER_PORT}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/api/orders/readyz', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
-  nginx:
-    image: nginx:1.27
-    container_name: inv-nginx
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
     depends_on:
       - inventory-service
       - order-service
     ports:
-      - "8080:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./frontend:/usr/share/nginx/html:ro
+      - "${GATEWAY_BIND:-0.0.0.0}:${GATEWAY_PORT:-8080}:8080"
 
 volumes:
   mysql-data:

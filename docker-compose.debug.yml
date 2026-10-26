@@ -1,0 +1,12 @@
+# Debug-only port mappings, bound to 127.0.0.1 so nothing is reachable from
+# other machines. Never use this file for a shared or public demo.
+#   docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d
+services:
+  mysql:
+    ports: ["127.0.0.1:3307:3306"]
+  redis:
+    ports: ["127.0.0.1:6379:6379"]
+  inventory-service:
+    ports: ["127.0.0.1:8001:8001"]
+  order-service:
+    ports: ["127.0.0.1:8002:8002"]

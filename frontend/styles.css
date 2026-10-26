@@ -161,3 +161,15 @@
     margin-top: 0 !important;
     margin-bottom: 0 !important;
 }
+/* --- Login, user box, alerts, role-based visibility --- */
+[hidden] { display: none !important; }
+.login-view { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #f8f9fc; padding: 16px; }
+.login-card { width: 100%; max-width: 380px; }
+.user-box { margin: 24px 12px 0; padding-top: 12px; border-top: 1px solid rgba(255, 255, 255, 0.25); color: #fff; }
+.alert-stack { position: fixed; top: 20px; right: 20px; z-index: 9999; min-width: 300px; max-width: 480px; }
+.role-viewer .staff-only { display: none !important; }
+.preserve-lines { white-space: pre-wrap; margin: 0; }
+/* Chart sizes live here, not in style="" attributes, so the CSP needs no 'unsafe-inline'. */
+.chart-box { position: relative; }
+.chart-box-lg { height: 300px; }
+.chart-box-md { height: 250px; }
