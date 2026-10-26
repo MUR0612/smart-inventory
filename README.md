@@ -1,321 +1,183 @@
 # Smart Inventory
 
-Smart Inventory is a containerized inventory and order management system built with FastAPI microservices, MySQL, Redis, Nginx, Docker Compose, and Kubernetes deployment manifests.
+Cloud Computing course project: a small inventory and order system built as two FastAPI
+services behind an Nginx gateway, with MySQL, Redis, Docker Compose and Kubernetes (local
+cluster or GKE).
 
-The project models a small manufacturing-style inventory workflow: products are stored in an inventory service, orders are processed through an order service, stock is reserved and released through service-to-service communication, and low-stock events are published through Redis.
+Status of every feature and fix, with the evidence behind it: [docs/STATUS.md](docs/STATUS.md).
+Architecture diagrams (editable Mermaid): [docs/architecture.md](docs/architecture.md).
 
-This project demonstrates backend service design, database-backed APIs, microservice communication, container orchestration, reverse proxy configuration, and deployment workflow for manufacturing or warehouse-style systems.
+## What it does
 
-## Features
+- **Products**: create, edit, delete (blocked when order history exists), search, sort, filter.
+- **Stock**: atomic adjust (row-locked), set with optional optimistic check, low-stock list,
+  inventory value statistics computed in SQL with exact decimals.
+- **Orders**: create with stock reservation (all-or-nothing, idempotent with `Idempotency-Key`),
+  list with pagination and full totals, status workflow, cancel/refund with exactly-once stock
+  return, delete only for closed orders.
+- **Access control**: login, roles `viewer` (read) and `staff` (read/write), service token
+  between services.
+- **Redis**: 30-second product-list cache (fails open to MySQL) and a Pub/Sub event log
+  (`stock_changes`, `low_stock_alerts`). The subscriber only logs events and keeps the last few
+  for `GET /api/orders/events/recent`. E-mail alerts, auto-replenishment and live browser
+  updates are **planned, not implemented**.
+- **Frontend**: Bootstrap + Chart.js single page, served by the gateway from the same origin.
 
-- Product CRUD APIs
-- Inventory stock adjustment APIs
-- Low-stock detection based on safety stock thresholds
-- Order creation with inventory availability checks
-- Stock reservation and release during order workflows
-- Order status workflow management
-- Redis Pub/Sub events for stock changes and low-stock alerts
-- MySQL persistence with SQLAlchemy ORM
-- Nginx reverse proxy for frontend and backend API routing
-- Docker Compose local deployment
-- Kubernetes manifests for service deployment, ingress, config, health checks, and autoscaling
-- Static frontend dashboard for products, orders, inventory, stock alerts, and reports
-
-## Tech Stack
-
-- Python
-- FastAPI
-- SQLAlchemy
-- MySQL
-- Redis
-- Nginx
-- Docker / Docker Compose
-- Kubernetes
-- JavaScript / HTML / CSS
-- PowerShell / Shell scripts
-
-## System Architecture
-
-```text
-Browser UI
-   |
-   v
-Nginx Reverse Proxy
-   |
-   +-- /api/inventory/* ---> Inventory Service ---> MySQL
-   |                              |
-   |                              +-- Redis cache / PubSub
-   |
-   +-- /api/orders/* ------> Order Service -------> MySQL
-                                  |
-                                  +-- calls Inventory Service
-                                  +-- subscribes to Redis events
+```
+browser ──► gateway (Nginx: frontend + /api proxy) ──► inventory-service ──► MySQL (shared schema)
+                                              └──────► order-service ─REST─┘   Redis (cache, Pub/Sub)
 ```
 
-## Project Structure
+## Quick start (Docker Compose)
 
-```text
-smart-inventory/
-├── frontend/
-│   ├── index.html
-│   ├── app.js
-│   └── styles.css
-├── inventory-service/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── models.py
-│   │   ├── routers/
-│   │   └── services/
-│   ├── Dockerfile
-│   └── requirements.txt
-├── order-service/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── models.py
-│   │   ├── routers/
-│   │   └── services/
-│   ├── Dockerfile
-│   └── requirements.txt
-├── nginx/
-│   └── nginx.conf
-├── k8s/
-│   ├── namespace.yaml
-│   ├── configmap.yaml
-│   ├── mysql.yaml
-│   ├── redis.yaml
-│   ├── inventory-service.yaml
-│   ├── order-service.yaml
-│   ├── ingress.yaml
-│   └── hpa.yaml
-└── docker-compose.yml
-```
-
-## Services
-
-### Inventory Service
-
-The inventory service owns product and stock data.
-
-Main responsibilities:
-
-- create, list, update, and delete products
-- track current stock and safety stock
-- adjust stock levels
-- detect low-stock items
-- publish stock-change and low-stock events through Redis
-- cache product list responses with Redis
-
-Example APIs:
-
-```text
-GET    /api/inventory/products
-POST   /api/inventory/products
-GET    /api/inventory/products/{product_id}
-PUT    /api/inventory/products/{product_id}
-DELETE /api/inventory/products/{product_id}
-
-GET    /api/inventory/stock
-GET    /api/inventory/stock/{product_id}
-POST   /api/inventory/stock/{product_id}/adjust
-GET    /api/inventory/low-stock
-```
-
-### Order Service
-
-The order service owns order data and coordinates with the inventory service.
-
-Main responsibilities:
-
-- create orders
-- check stock availability before order creation
-- reserve stock by calling the inventory service
-- release stock when orders are cancelled
-- list and retrieve order details
-- manage order status transitions
-- subscribe to Redis inventory events
-
-Example APIs:
-
-```text
-GET    /api/orders/
-POST   /api/orders/
-GET    /api/orders/{order_id}
-PUT    /api/orders/{order_id}
-PATCH  /api/orders/{order_id}/status
-DELETE /api/orders/{order_id}
-GET    /api/orders/{order_id}/workflow
-```
-
-## Data Model
-
-Core tables include:
-
-- `products`
-- `inventory`
-- `orders`
-- `order_items`
-
-The product and inventory tables are managed by the inventory service. The order and order item tables are managed by the order service.
-
-## Redis Usage
-
-Redis is used for:
-
-- product list caching
-- low-stock alert publishing
-- stock-change event publishing
-- inventory update event publishing
-
-This adds an event-driven communication path between inventory changes and downstream service behavior.
-
-## Local Development With Docker Compose
-
-Create a local `.env` file:
-
-```env
-MYSQL_ROOT_PASSWORD=rootpassword
-MYSQL_DATABASE=smart_inventory
-MYSQL_USER=inventory_user
-MYSQL_PASSWORD=inventory_password
-REDIS_HOST=redis
-REDIS_PORT=6379
-INVENTORY_PORT=8001
-ORDER_PORT=8002
-```
-
-Start the system:
+Requirements: Docker with Compose v2, Python 3.10+ (only for the setup script).
 
 ```bash
-docker compose up --build
+python scripts/init_env.py
+docker compose up -d --build --wait
 ```
 
-The system runs:
+Open http://localhost:8080 and sign in with the user names and passwords that `init_env.py`
+wrote to `.env.credentials` (`admin` is staff, `viewer` is read-only). Both `.env` and
+`.env.credentials` are git-ignored; never commit or zip them.
 
-```text
-Frontend / Nginx:       http://localhost:8080
-Inventory Service API:  http://localhost:8001
-Order Service API:      http://localhost:8002
-MySQL:                  localhost:3307
-Redis:                  localhost:6379
-```
+- Only the gateway is published. For debugging, `docker compose -f docker-compose.yml -f
+  docker-compose.debug.yml up -d` also binds MySQL/Redis/services to 127.0.0.1.
+- Set `GATEWAY_BIND=127.0.0.1` in `.env` to keep the site private on shared networks.
+  Local Compose uses plain HTTP; public deployments use HTTPS (see the Kubernetes guide).
+- Add users: `python scripts/hash_password.py <name> <staff|viewer>` and append the line to
+  `AUTH_USERS` in `.env`, then `docker compose up -d`.
+- Stop: `docker compose down` (keeps data) or `docker compose down -v` (deletes the database volume).
 
-Stop the system:
+Upgrading an existing installation: the migration adopts the old Compose and old Kubernetes
+schemas in place (tested, see STATUS). The old Compose stack used **MySQL 5.7**. MySQL 8.4 cannot
+open a 5.7 data directory directly, so back up first and restore into the new stack:
 
 ```bash
-docker compose down
+docker compose exec -T mysql sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --single-transaction smart_inventory' > backup.sql
 ```
 
-Remove volumes:
+Run that against the **old** stack before switching. Then start the new stack with an empty
+volume, load `backup.sql` into it, and run `docker compose up -d` so the migration converts it.
+
+## Configuration
+
+One contract for Compose (`.env`) and Kubernetes (ConfigMap + Secret):
+
+| Variable | Secret | Used by | Meaning |
+|---|---|---|---|
+| `DB_HOST`, `DB_PORT`, `DB_NAME` | no | services, migrate | MySQL location |
+| `DB_USER`, `DB_PASSWORD` | yes | services, migrate | least-privilege app account (DML only) |
+| `MYSQL_ROOT_PASSWORD` | yes | mysql, migrate | admin account, never given to the services |
+| `REDIS_HOST`, `REDIS_PORT` | no | inventory, order | Redis location |
+| `INVENTORY_BASE_URL` | no | order | e.g. `http://inventory-service:8001` |
+| `AUTH_SECRET` (>= 32 chars) | yes | both services | signs login tokens |
+| `SERVICE_TOKEN` (>= 24 chars) | yes | both services | order-service to inventory-service calls |
+| `AUTH_USERS` | yes | inventory | `name:role:pbkdf2-hash,...` |
+| `CORS_ALLOWED_ORIGINS` | no | both services | empty = same-origin only (default) |
+| `ENABLE_API_DOCS` | no | both services | Swagger at `/api/inventory/docs`, `/api/orders/docs` |
+| `SEED_DEMO_DATA` | no | migrate | insert 3 demo products into an empty database |
+
+Missing values or values still containing `CHANGE_ME` stop the service with an error that
+names the variable and never prints the value.
+
+## Database schema and migrations
+
+`db/migrate.py` is the single source of the schema. It runs as a one-off container (Compose
+`migrate` service, Kubernetes `db-migrate` Job), never inside the app replicas. It:
+
+- creates a fresh schema, or converts the legacy Compose / legacy Kubernetes schemas in place;
+- checks before every change, so re-running it changes nothing;
+- creates the DML-only application account and sets its password (password rotation);
+- backfills reservation records for pre-existing orders.
+
+Each service's readiness check waits for the schema version it needs.
+
+## API overview
+
+All paths go through the gateway. Every endpoint except health checks and login needs
+`Authorization: Bearer <token>`.
+
+| Method and path | Role | Notes |
+|---|---|---|
+| `POST /api/auth/login` | anyone | `{username, password}` -> token; rate-limited |
+| `GET /api/inventory/products`, `/products/{id}`, `/stock`, `/stock/{id}`, `/low-stock`, `/stats` | viewer | prices are decimal strings |
+| `POST/PUT/DELETE /api/inventory/products[/{id}]` | staff | validated; duplicate SKU 409 |
+| `POST /api/inventory/stock/{id}/adjust` `{adjustment}` | staff | negative allowed, never below 0 |
+| `POST /api/inventory/stock/{id}/set` `{stock, expected_stock?}` | staff | physical count |
+| `/api/inventory/reservations[...]` | service token only | reserve / release / commit |
+| `GET /api/orders?skip&limit&status` | viewer | `{items, total, skip, limit}`, limit <= 200 |
+| `GET /api/orders/stats`, `/{id}`, `/{id}/workflow`, `/events/recent` | viewer | |
+| `POST /api/orders` (+ `Idempotency-Key`) | staff | 201 new, 200 replay |
+| `PATCH /api/orders/{id}/status` `{status}`, `POST /api/orders/{id}/cancel` | staff | one state machine |
+| `DELETE /api/orders/{id}` | staff | closed orders only |
+| `POST /api/orders/admin/reconcile` | staff | retry pending stock work now |
+| `GET /api/<inventory|orders>/livez`, `/readyz`, `/healthz`; `GET /healthz` (gateway) | anyone | |
+
+## Tests
 
 ```bash
-docker compose down -v
+bash scripts/test-unit.sh
+pip install -r tests/requirements.txt
+bash scripts/test-compose.sh
+python tests/smoke_test.py --base-url http://localhost:8080 --credentials-file .env.credentials
+bash deploy/deploy.sh validate local
+bash tests/upgrade/run_upgrade_test.sh legacy_compose
+bash tests/upgrade/run_upgrade_test.sh legacy_k8s
+bash scripts/secret-scan.sh
 ```
 
-## Nginx Routing
+| Command | What it covers |
+|---|---|
+| `test-unit.sh` | unit tests in Docker (SQLite + fakes) and frontend XSS tests (Node/jsdom) |
+| `test-compose.sh` | disposable stack: smoke, integration, fault injection (MySQL, Redis, inventory outages, published ports) |
+| `smoke_test.py` | quick end-to-end check of a running stack; adds `SMOKE-` products/orders, exits 1 on failure |
+| `deploy.sh validate` | renders and validates Kubernetes manifests without a cluster |
+| `run_upgrade_test.sh` | old Compose / old Kubernetes schemas with existing orders upgraded in place |
+| `secret-scan.sh` | gitleaks on tracked files (add `--history` for the full history) |
 
-Nginx serves the frontend and routes backend API traffic:
+The integration tests also run against Kubernetes: set `BASE_URL` to the ingress address and
+`CREDENTIALS_FILE`. What was actually run, where, and with what result is recorded in
+[docs/STATUS.md](docs/STATUS.md).
 
-```text
-/api/inventory/*  -> inventory-service:8001
-/api/orders/*     -> order-service:8002
-/healthz          -> Nginx health check
-```
+## Deployment
 
-This provides a single browser-facing entry point while keeping backend services separated.
+Kubernetes (local cluster or GKE) uses `deploy/deploy.sh`. Read [k8s/README.md](k8s/README.md)
+before deploying anything billable. It covers prerequisites, HTTPS, the autoscaling and rollout
+demos, cost and cleanup. GKE has **not** been deployed or verified with this version of the code.
 
-## Kubernetes Deployment
-
-The `k8s/` directory contains deployment manifests and helper scripts for running the system on a Kubernetes cluster.
-
-Included resources:
-
-- namespace
-- config maps
-- MySQL deployment/service
-- Redis deployment/service
-- inventory service deployment/service
-- order service deployment/service
-- ingress
-- horizontal pod autoscaler
-- deployment and cleanup scripts
-
-Typical deployment flow:
+## Submission package
 
 ```bash
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/mysql.yaml
-kubectl apply -f k8s/redis.yaml
-kubectl apply -f k8s/inventory-service.yaml
-kubectl apply -f k8s/order-service.yaml
-kubectl apply -f k8s/ingress.yaml
-kubectl apply -f k8s/hpa.yaml
+bash scripts/package.sh
 ```
 
-Check deployment status:
+This builds `dist/smart-inventory-<commit>.zip` from committed files only (no `.git`, `.env` or
+local data) and secret-scans it.
 
-```bash
-kubectl get pods -n smart-inventory
-kubectl get services -n smart-inventory
-kubectl get ingress -n smart-inventory
-kubectl get hpa -n smart-inventory
-```
+## Known limitations
 
-## Testing And Validation
+- One shared MySQL schema for both services (foreign keys from order data to products). This is a
+  deliberate course-scale trade-off; see [docs/architecture.md](docs/architecture.md).
+- Cross-service consistency uses a recorded-intent + idempotent-retry saga, not a distributed
+  transaction. Pending stock work is retried every 30 s; `inventory_sync` and `sync_error` show it.
+- Redis Pub/Sub is a non-durable event log; the cache can be up to 30 s stale only if Redis fails
+  during a write.
+- Access control is minimal (two roles, no token revocation, no MFA): [docs/SECURITY.md](docs/SECURITY.md).
+- Single MySQL instance: the PVC keeps data across pod restarts but is not a backup or HA.
+- Order timestamps written by the old code mix Sydney local time and UTC and were not converted;
+  new data is stored in UTC and returned with an explicit offset.
+- `PAID` is a manual status change; there is no payment provider integration.
 
-Suggested local checks:
+## Credentials in git history
 
-```bash
-docker compose up --build
-```
+Earlier commits contain real-looking database credentials. They must be rotated, and history
+cleanup is optional. See [docs/SECURITY.md](docs/SECURITY.md) §1.
 
-Health checks:
+## AI assistance
 
-```bash
-curl http://localhost:8080/healthz
-curl http://localhost:8001/api/healthz
-curl http://localhost:8002/api/healthz
-```
-
-Kubernetes checks:
-
-```bash
-kubectl logs -f deployment/inventory-service -n smart-inventory
-kubectl logs -f deployment/order-service -n smart-inventory
-kubectl describe pod <pod-name> -n smart-inventory
-```
-
-## Security Note
-
-Environment values should be stored in a local `.env` file or Kubernetes Secrets, not committed as real production credentials.
-
-For portfolio use, keep only a `.env.example` file in the repository and add `.env` to `.gitignore`.
-
-## Portfolio Focus
-
-This project demonstrates:
-
-- backend API design with FastAPI
-- microservice separation
-- service-to-service HTTP communication
-- database-backed business workflows
-- Redis caching and Pub/Sub events
-- containerized local deployment
-- Nginx reverse proxy routing
-- Kubernetes deployment configuration
-- health checks and operational validation
-- manufacturing-style inventory/order system modeling
-
-## Resume Summary
-
-Smart Inventory is a containerized microservice-based inventory and order management system using FastAPI, MySQL, Redis, Nginx, Docker Compose, and Kubernetes. It models product management, stock adjustment, low-stock alerts, order creation, inventory reservation, and deployment workflows for manufacturing-style backend systems.
-
-## Future Improvements
-
-- Replace committed `.env` values with `.env.example` and secrets management.
-- Add automated API tests for inventory and order workflows.
-- Add transaction-safe stock reservation logic for concurrent orders.
-- Add authentication and role-based access control.
-- Add structured logging and request tracing.
-- Add CI checks for Docker builds and service health tests.
-- Add frontend build tooling or migrate the dashboard to a modern frontend framework.
+The October 2026 remediation (security fixes, consistency redesign, tests, deployment and
+documentation) was carried out with an AI coding assistant (Claude) working from a written
+review brief. The project author still needs to review it before submission. Check your course's
+rules on AI use and declare it in your submission accordingly. The original rubric was not
+available when this was written.
