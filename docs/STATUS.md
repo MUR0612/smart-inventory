@@ -40,7 +40,7 @@ created by `db/migrate.py`, `.dockerignore`, `scripts/package.sh` (ZIP from `git
 | Secret scan of tracked files (`bash scripts/secret-scan.sh`) | **Passed** (no leaks after renaming two test variables that were false positives) |
 | Stack starts from self-created settings (`init_env.py` + Compose) | **Passed** (E3) |
 | App account privileges after migration (`SHOW GRANTS`) = `SELECT, INSERT, UPDATE, DELETE` only, legacy `ALL PRIVILEGES` revoked | **Passed** (upgrade test, E3) |
-| Secret scan of the delivery ZIP (`scripts/package.sh`) | **Not run**: needs a commit; the changes are not committed yet |
+| Secret scan of the delivery ZIP (`scripts/package.sh`: `git archive` of HEAD, then gitleaks) | **Passed** (no leaks; ZIP has no `.git`, `.env` or credentials files) |
 | History scan (`secret-scan.sh --history`) | Run: 4 findings in `8e22b62` (k8s/configmap.yaml, POWERSHELL_TESTING_GUIDE.md); manual review lists more (SECURITY.md §1) |
 | Rotation of the leaked passwords | **Not done** (owner action) |
 | History rewrite / force push | **Not done** (needs owner decision; steps in SECURITY.md) |
@@ -296,7 +296,7 @@ repository and were not modified.
 ## Open items needing the owner
 
 1. Rotate the leaked database passwords; decide on history rewrite (SECURITY.md §1).
-2. Review and commit this branch; then `bash scripts/package.sh` to build and scan the ZIP.
+2. Review the commits on `fix/brief-remediation` (not pushed) and merge when satisfied; rebuild the ZIP with `bash scripts/package.sh` from the final commit.
 3. GKE (only with budget approval): Artifact Registry repo, cluster, static IP, DNS, then
    `deploy.sh validate/build/push/apply gke --yes`; record HTTPS, backend health, HPA and rollout
    results here.
