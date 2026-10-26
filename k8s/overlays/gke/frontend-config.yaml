@@ -1,0 +1,8 @@
+# Redirect plain HTTP to HTTPS at the load balancer.
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: smart-inventory-frontend
+spec:
+  redirectToHttps:
+    enabled: true

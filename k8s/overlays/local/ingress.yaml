@@ -1,0 +1,18 @@
+# Local ingress: plain HTTP, everything goes to the gateway, paths unchanged.
+# INGRESS_CLASS (default nginx = ingress-nginx) can be changed by deploy.sh.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smart-inventory
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80

@@ -1,0 +1,21 @@
+# Local cluster (Docker Desktop Kubernetes, kind, k3s, minikube).
+# Images are built locally by deploy/deploy.sh build local; HTTP only.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: smart-inventory
+resources:
+  - ../../base
+  - ingress.yaml
+images:
+  - name: inventory-service
+    newName: smart-inventory/inventory-service
+    newTag: local
+  - name: order-service
+    newName: smart-inventory/order-service
+    newTag: local
+  - name: gateway
+    newName: smart-inventory/gateway
+    newTag: local
+  - name: db-migrate
+    newName: smart-inventory/db-migrate
+    newTag: local

@@ -1,0 +1,20 @@
+# Shared Kubernetes resources. Do not apply this directory directly; use an
+# overlay (overlays/local or overlays/gke) through deploy/deploy.sh.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: smart-inventory
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: smart-inventory
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - mysql.yaml
+  - redis.yaml
+  - migrate-job.yaml
+  - inventory-service.yaml
+  - order-service.yaml
+  - gateway.yaml
+  - hpa.yaml
+# The Secret "smart-inventory-secret" is NOT part of the manifests. deploy.sh
+# creates it from your local .env (see k8s/README.md); it is never committed.

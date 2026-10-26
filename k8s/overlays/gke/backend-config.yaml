@@ -1,0 +1,10 @@
+# Explicit load-balancer health check against the gateway (container port 8080).
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: gateway-backend
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 8080

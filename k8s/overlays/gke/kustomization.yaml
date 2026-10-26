@@ -1,0 +1,39 @@
+# Google Kubernetes Engine: GCE external Application Load Balancer with a
+# Google-managed certificate (HTTPS) in front of the gateway.
+# deploy/deploy.sh render gke fills in project/region/tag/domain in a
+# temporary copy; the placeholders below are never deployed as-is.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: smart-inventory
+resources:
+  - ../../base
+  - ingress.yaml
+  - managed-certificate.yaml
+  - frontend-config.yaml
+  - backend-config.yaml
+images:
+  - name: inventory-service
+    newName: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/inventory-service
+    newTag: IMAGE_TAG
+  - name: order-service
+    newName: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/order-service
+    newTag: IMAGE_TAG
+  - name: gateway
+    newName: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/gateway
+    newTag: IMAGE_TAG
+  - name: db-migrate
+    newName: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/db-migrate
+    newTag: IMAGE_TAG
+patches:
+  - target: {kind: Service, name: gateway}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          cloud.google.com/neg: '{"ingress": true}'
+          cloud.google.com/backend-config: '{"default": "gateway-backend"}'
+  - target: {kind: ConfigMap, name: smart-inventory-config}
+    patch: |-
+      - op: replace
+        path: /data/ENABLE_API_DOCS
+        value: "false"

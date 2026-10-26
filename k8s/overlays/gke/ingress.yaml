@@ -1,0 +1,19 @@
+# GCE Ingress (not ingress-nginx: no nginx.* annotations here). Requirements:
+# - a reserved global static IP named smart-inventory-ip
+# - a DNS A record for your domain pointing at that IP (needed for the certificate)
+# Google-managed certificates require the ingress.class annotation (not ingressClassName).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smart-inventory
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "smart-inventory-ip"
+    networking.gke.io/managed-certificates: "smart-inventory-cert"
+    networking.gke.io/v1beta1.FrontendConfig: "smart-inventory-frontend"
+spec:
+  defaultBackend:
+    service:
+      name: gateway
+      port:
+        number: 80

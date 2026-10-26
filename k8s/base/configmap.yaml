@@ -1,0 +1,15 @@
+# Non-secret settings. Same variable names as docker-compose.yml, and the
+# Service names below (mysql, redis, inventory-service) match Compose too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smart-inventory-config
+data:
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: smart_inventory
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  INVENTORY_BASE_URL: http://inventory-service:8001
+  ENABLE_API_DOCS: "true"
+  SEED_DEMO_DATA: "true"

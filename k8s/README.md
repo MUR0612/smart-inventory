@@ -1,182 +1,161 @@
-# Smart Inventory - Kubernetes 部署指南
+# Kubernetes deployment
 
-## 📋 概述
+One layout, two targets:
 
-這個目錄包含了將 Smart Inventory 系統部署到 Kubernetes 集群所需的所有配置文件。
-
-## 🏗️ 架構組件
-
-### 核心服務
-- **MySQL**: 資料庫服務
-- **Redis**: 快取服務
-- **Inventory Service**: 庫存管理微服務
-- **Order Service**: 訂單管理微服務
-
-### Kubernetes 資源
-- **Namespace**: `smart-inventory`
-- **Deployments**: 每個服務的部署配置
-- **Services**: 內部服務發現
-- **Ingress**: 外部訪問入口
-- **HPA**: 水平自動擴展
-- **ConfigMaps & Secrets**: 配置管理
-
-## 🚀 快速部署
-
-### 前置需求
-1. Kubernetes 集群 (minikube, kind, 或雲端集群)
-2. kubectl 命令行工具
-3. Docker 映像檔已建立
-
-### 部署步驟
-
-1. **建立 Docker 映像檔** (如果尚未建立):
-```bash
-# 在專案根目錄
-docker build -t inventory-service:latest ./inventory-service
-docker build -t order-service:latest ./order-service
+```
+k8s/base/              shared manifests (namespace, config, MySQL StatefulSet + PVC, Redis,
+                       migration Job, inventory/order services, gateway, HPA)
+k8s/overlays/local/    local cluster: locally built images, HTTP ingress (ingress-nginx by default)
+k8s/overlays/gke/      GKE: Artifact Registry images, GCE ingress, static IP, Google-managed TLS
+k8s/local-only/        metrics-server with --kubelet-insecure-tls, for Docker Desktop ONLY
+deploy/deploy.sh       the only deployment entry point (render / validate / build / push / secret / apply / cleanup)
 ```
 
-2. **載入映像檔到 Kubernetes** (如果是本地集群):
-```bash
-# 對於 minikube
-minikube image load inventory-service:latest
-minikube image load order-service:latest
+The browser only talks to the **gateway** (Nginx serving the frontend and proxying `/api/*`
+unchanged). The Ingress has a single backend, the gateway Service, so there is no path rewriting
+and the same gateway config runs in Docker Compose and Kubernetes. Service names (`mysql`,
+`redis`, `inventory-service`, `order-service`) and environment variable names are the same as in
+`docker-compose.yml`.
 
-# 對於 kind
-kind load docker-image inventory-service:latest
-kind load docker-image order-service:latest
+What runs where:
+
+| Component | Kind | Notes |
+|---|---|---|
+| gateway | Deployment (2 replicas) + Service | `/healthz` used by probes and the GKE load balancer |
+| inventory-service, order-service | Deployment + Service + HPA (1-4 pods, 60% CPU) | liveness `/api/<svc>/livez`, readiness `/api/<svc>/readyz` (MySQL + schema version) |
+| mysql | StatefulSet (1 replica) + headless Service + 10 GiB PVC | data survives pod deletion; **not** a backup, **not** HA |
+| redis | Deployment + Service | cache and demo event channel, no persistence |
+| db-migrate | Job | runs `db/migrate.py` once per deploy; also creates the DML-only app account |
+
+## Configuration and secrets
+
+`smart-inventory-config` (ConfigMap, committed) holds non-secret values. The Secret
+`smart-inventory-secret` is **never committed**; `deploy.sh secret` creates it from your local
+`.env` (keys `DB_USER, DB_PASSWORD, MYSQL_ROOT_PASSWORD, AUTH_SECRET, SERVICE_TOKEN, AUTH_USERS`).
+Apps only receive the keys they need (never the MySQL root password). `apply` refuses to run if
+the Secret is missing, and the services refuse to start with missing or placeholder values.
+
+## Validate without a cluster (no cost)
+
+```bash
+bash deploy/deploy.sh validate local
 ```
 
-3. **執行部署腳本**:
 ```bash
-chmod +x deploy.sh
-./deploy.sh
+PROJECT_ID=my-project REGION=australia-southeast1 REPOSITORY=smart-inventory DOMAIN=inventory.example.com IMAGE_TAG=dryrun bash deploy/deploy.sh validate gke
 ```
 
-4. **手動部署** (可選):
+`validate` renders to `dist/k8s-<env>.yaml`, fails if placeholders remain, runs kubeconform
+offline, and adds `kubectl apply --dry-run=server` when a cluster is reachable. GKE custom
+resources (ManagedCertificate, FrontendConfig, BackendConfig) have no offline schema and are
+reported as skipped; only a real GKE cluster validates them.
+
+## Local cluster (Docker Desktop Kubernetes, kind, k3s, minikube)
+
 ```bash
-kubectl apply -f namespace.yaml
-kubectl apply -f configmap.yaml
-kubectl apply -f mysql.yaml
-kubectl apply -f redis.yaml
-kubectl apply -f inventory-service.yaml
-kubectl apply -f order-service.yaml
-kubectl apply -f ingress.yaml
-kubectl apply -f hpa.yaml
+python scripts/init_env.py
+bash deploy/deploy.sh build local
+bash deploy/deploy.sh secret .env
+bash deploy/deploy.sh apply local
 ```
 
-## 🔍 驗證部署
+- kind / k3s / minikube do not see Docker Desktop images automatically: load them first
+  (`kind load docker-image ...`, `k3s ctr images import`, `minikube image load ...`).
+- The ingress uses `ingressClassName: nginx` (ingress-nginx). For another controller:
+  `INGRESS_CLASS=traefik bash deploy/deploy.sh apply local` (k3s ships Traefik).
+- HPA needs a metrics API. k3s and GKE include one. On Docker Desktop, metrics-server only works
+  with kubelet TLS verification disabled: `kubectl apply -f k8s/local-only/metrics-server-insecure-tls.yaml`.
+  Never apply anything from `k8s/local-only/` to a shared or cloud cluster.
 
-### 檢查 Pod 狀態
+## GKE (billable: confirm budget and region before each step)
+
+`deploy.sh` never creates or deletes clusters, IP addresses or registries. Run these yourself,
+once, after checking current prices for your region. Commands follow the current GKE docs
+(Artifact Registry replaces the shut-down Container Registry; a Google-managed certificate needs a
+domain you control); re-check them against Google's documentation when you deploy.
+
 ```bash
-kubectl get pods -n smart-inventory
+gcloud config set project PROJECT_ID
+gcloud services enable container.googleapis.com artifactregistry.googleapis.com compute.googleapis.com
+gcloud artifacts repositories create smart-inventory --repository-format=docker --location=REGION
+gcloud auth configure-docker REGION-docker.pkg.dev
+gcloud container clusters create smart-inventory --zone=ZONE --num-nodes=2 --machine-type=e2-standard-2
+gcloud container clusters get-credentials smart-inventory --zone=ZONE
+gcloud compute addresses create smart-inventory-ip --global
+gcloud compute addresses describe smart-inventory-ip --global --format='value(address)'
 ```
 
-### 檢查服務狀態
+Point a DNS A record for `DOMAIN` at that address, then (from a clean, committed checkout so the
+image tag is the commit hash):
+
 ```bash
-kubectl get services -n smart-inventory
+export PROJECT_ID=... REGION=... REPOSITORY=smart-inventory DOMAIN=...
+bash deploy/deploy.sh validate gke
+bash deploy/deploy.sh build gke
+bash deploy/deploy.sh push gke
+bash deploy/deploy.sh secret .env
+bash deploy/deploy.sh apply gke --yes
 ```
 
-### 檢查 HPA 狀態
+After `apply`: certificate provisioning takes from minutes up to about an hour
+(`kubectl -n smart-inventory describe managedcertificate smart-inventory-cert`). Check backend
+health in the Ingress annotations (`kubectl -n smart-inventory describe ingress smart-inventory`)
+and test `https://DOMAIN/`, `https://DOMAIN/api/inventory/readyz` and `https://DOMAIN/api/orders/readyz`.
+Plain HTTP is redirected to HTTPS by the FrontendConfig. Until the certificate is `Active` the site
+is not served over HTTPS; do not share the URL before then.
+
+The 2 x e2-standard-2 cluster above is a **configuration choice, not a measured cost**. Check the
+real cost in the billing console for the hours you actually ran it.
+
+## Demonstrations (run them, keep the output)
+
+Autoscaling (Pod HPA; node autoscaling is a separate cluster setting and is not configured here):
+
 ```bash
-kubectl get hpa -n smart-inventory
+kubectl -n smart-inventory get hpa -w
+python scripts/traffic_check.py --base-url https://DOMAIN --credentials-file .env.credentials --seconds 180 --workers 6
 ```
 
-### 檢查 Ingress
+Rolling update and rollback while measuring failed requests:
+
 ```bash
-kubectl get ingress -n smart-inventory
+python scripts/traffic_check.py --base-url https://DOMAIN --credentials-file .env.credentials --seconds 150 --workers 3
+kubectl -n smart-inventory rollout restart deployment/inventory-service deployment/order-service deployment/gateway
+kubectl -n smart-inventory rollout undo deployment/inventory-service
 ```
 
-## 🧪 測試功能
+Run the first command in one terminal and the `kubectl` commands in a second one while it is
+running. `traffic_check.py` prints every failed request and exits 1 if there was any, so "no
+failed requests" is a measurement, not an assumption. Images are tagged with the commit hash
+(immutable), so `rollout undo` returns to exactly the previous build. Schema changes must stay
+backwards compatible for one release, because old and new pods run side by side during a rollout;
+the readiness check waits for the schema version each build needs.
 
-### 1. Rolling Update 測試
+Persistence:
+
 ```bash
-# 更新映像檔
-kubectl set image deployment/inventory-service inventory-service=inventory-service:v2 -n smart-inventory
-
-# 監控更新過程
-kubectl rollout status deployment/inventory-service -n smart-inventory
-
-# 回滾
-kubectl rollout undo deployment/inventory-service -n smart-inventory
+kubectl -n smart-inventory delete pod mysql-0
+kubectl -n smart-inventory wait --for=condition=ready pod/mysql-0 --timeout=300s
 ```
 
-### 2. 自動擴展測試
-```bash
-# 產生負載 (需要安裝 hey 工具)
-hey -n 1000 -c 10 http://localhost/api/inventory/healthz
+Create a product before deleting the pod and check it is still there afterwards.
 
-# 監控 HPA
-kubectl get hpa -n smart-inventory -w
+Recorded results from a local k3s run are in [docs/STATUS.md](../docs/STATUS.md). Nothing has
+been verified on GKE yet.
+
+## Cleanup
+
+```bash
+bash deploy/deploy.sh cleanup
 ```
 
-### 3. 健康檢查測試
-```bash
-# 檢查 Pod 健康狀態
-kubectl describe pod <pod-name> -n smart-inventory
+This removes workloads but **keeps** the namespace, the Secret and the MySQL PVC (data).
+`bash deploy/deploy.sh cleanup --delete-data` also deletes the PVC and namespace. To stop GKE
+billing you must also delete the cluster and the static IP yourself:
 
-# 檢查服務端點
-kubectl get endpoints -n smart-inventory
+```bash
+gcloud container clusters delete smart-inventory --zone=ZONE
+gcloud compute addresses delete smart-inventory-ip --global
 ```
 
-## 🛠️ 故障排除
-
-### 常見問題
-
-1. **Pod 無法啟動**
-   ```bash
-   kubectl describe pod <pod-name> -n smart-inventory
-   kubectl logs <pod-name> -n smart-inventory
-   ```
-
-2. **服務無法連接**
-   ```bash
-   kubectl get services -n smart-inventory
-   kubectl describe service <service-name> -n smart-inventory
-   ```
-
-3. **HPA 不工作**
-   ```bash
-   kubectl describe hpa <hpa-name> -n smart-inventory
-   kubectl top pods -n smart-inventory
-   ```
-
-### 清理資源
-```bash
-kubectl delete namespace smart-inventory
-```
-
-## 📊 監控和日誌
-
-### 查看日誌
-```bash
-# 查看特定服務日誌
-kubectl logs -f deployment/inventory-service -n smart-inventory
-kubectl logs -f deployment/order-service -n smart-inventory
-
-# 查看所有 Pod 日誌
-kubectl logs -f -l app=inventory-service -n smart-inventory
-```
-
-### 資源使用情況
-```bash
-kubectl top pods -n smart-inventory
-kubectl top nodes
-```
-
-## 🔧 配置說明
-
-### 環境變數
-- `DB_URL`: 資料庫連接字串
-- `REDIS_HOST`: Redis 主機地址
-- `REDIS_PORT`: Redis 端口
-- `INVENTORY_BASE_URL`: 庫存服務 URL
-
-### 資源限制
-- **CPU**: 100m-200m
-- **Memory**: 128Mi-256Mi
-- **Storage**: 1Gi (MySQL)
-
-### 健康檢查
-- **Liveness Probe**: 30秒後開始，每10秒檢查
-- **Readiness Probe**: 5秒後開始，每5秒檢查
+Check the console afterwards for leftover disks and load balancers.

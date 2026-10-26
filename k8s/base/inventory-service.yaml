@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+spec:
+  selector:
+    app: inventory-service
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+spec:
+  # No "replicas" field: the HPA owns the replica count, re-applying must not reset it.
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0  # keep serving during updates; new pod must be ready first
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: inventory-service
+  template:
+    metadata:
+      labels:
+        app: inventory-service
+    spec:
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: inventory-service
+          image: inventory-service
+          ports:
+            - containerPort: 8001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: smart-inventory-config
+          # Only the secrets this service needs (never the MySQL root password).
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: DB_USER}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: DB_PASSWORD}
+            - name: AUTH_SECRET
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: AUTH_SECRET}
+            - name: SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: SERVICE_TOKEN}
+            - name: AUTH_USERS
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: AUTH_USERS}
+          # Keep serving while the endpoint removal reaches kube-proxy / ingress,
+          # then shut down gracefully (measured: without this, rollouts dropped requests).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:
+            httpGet: {path: /api/inventory/livez, port: http}
+            periodSeconds: 3
+            failureThreshold: 20
+          # Liveness never checks MySQL/Redis, so a DB outage cannot cause a restart storm.
+          livenessProbe:
+            httpGet: {path: /api/inventory/livez, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          # Readiness requires MySQL + the migrated schema; Redis down = "degraded" but ready.
+          readinessProbe:
+            httpGet: {path: /api/inventory/readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2

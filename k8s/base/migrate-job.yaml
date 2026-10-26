@@ -1,0 +1,50 @@
+# One-off schema migration (db/migrate.py). Runs before/alongside a rollout;
+# app pods only become ready once the schema version they need exists.
+# Jobs are immutable, so deploy.sh deletes the previous run before applying.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: db-migrate
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: db-migrate
+          envFrom:
+            - configMapRef:
+                name: smart-inventory-config
+          env:
+            - name: MIGRATE_DB_USER
+              value: root
+            - name: MIGRATE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: MYSQL_ROOT_PASSWORD}
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: DB_USER}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: smart-inventory-secret, key: DB_PASSWORD}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
