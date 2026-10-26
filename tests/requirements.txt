@@ -1,0 +1,3 @@
+# Host-side test tools for tests/integration (the services' own deps are in their lock files).
+pytest==9.1.1
+httpx==0.28.1
