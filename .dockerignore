@@ -1,0 +1,13 @@
+# Build context is the repository root; keep secrets and history out of images.
+.git
+.env
+.env.*
+*.credentials
+**/__pycache__
+**/*.pyc
+.venv
+venv
+dist
+*.zip
+tests
+docs

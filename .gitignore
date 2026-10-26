@@ -1,0 +1,21 @@
+# Secrets and local configuration - never commit
+.env
+.env.*
+!.env.example
+*.credentials
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Build / packaging output
+dist/
+*.zip
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+k8s/.render/
