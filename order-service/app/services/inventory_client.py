@@ -1,91 +1,94 @@
+"""HTTP client for inventory-service (authenticated with the service token).
+
+Errors are split by what they tell us about the remote side effect:
+
+* ``InventoryRejected``   - a definite 4xx answer: nothing was applied.
+* ``InventoryUnavailable`` - timeout, connection error or 5xx: the outcome is
+  UNKNOWN (the request may have been applied and only the response lost).
+"""
+import logging
+
 import httpx
-import os
-from typing import Dict, List, Optional
-from fastapi import HTTPException
+
+from smart_shared import auth
+from smart_shared.config import optional, require
+from smart_shared.observability import log_fields, request_id_var
+
+logger = logging.getLogger("order-service.inventory-client")
+
+
+class InventoryError(Exception):
+    pass
+
+
+class InventoryRejected(InventoryError):
+    def __init__(self, status_code: int, detail):
+        super().__init__(f"inventory rejected request ({status_code})")
+        self.status_code = status_code
+        self.detail = detail
+
+
+class InventoryUnavailable(InventoryError):
+    pass
+
 
 class InventoryClient:
-    """庫存服務客戶端"""
-    
-    def __init__(self):
-        self.base_url = os.getenv("INVENTORY_BASE_URL", "http://inventory-service:8001")
-        self.timeout = 30.0
-    
-    async def check_stock(self, product_id: int, required_qty: int) -> Dict:
-        """檢查產品庫存是否足夠"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.base_url}/api/inventory/stock/{product_id}")
-                response.raise_for_status()
-                
-                stock_info = response.json()
-                if stock_info["current_stock"] < required_qty:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Insufficient stock for product {product_id}. "
-                               f"Required: {required_qty}, Available: {stock_info['current_stock']}"
-                    )
-                
-                return stock_info
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Inventory service unavailable: {str(e)}")
-    
-    async def reserve_stock(self, product_id: int, qty: int) -> Dict:
-        """預留庫存（減少庫存）"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                adjustment_data = {"adjustment": -qty}
-                response = await client.post(
-                    f"{self.base_url}/api/inventory/stock/{product_id}/adjust",
-                    json=adjustment_data
-                )
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
-            elif e.response.status_code == 400:
-                raise HTTPException(status_code=409, detail="Insufficient stock")
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Inventory service unavailable: {str(e)}")
-    
-    async def release_stock(self, product_id: int, qty: int) -> Dict:
-        """釋放庫存（增加庫存）"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                adjustment_data = {"adjustment": qty}
-                response = await client.post(
-                    f"{self.base_url}/api/inventory/stock/{product_id}/adjust",
-                    json=adjustment_data
-                )
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Inventory service unavailable: {str(e)}")
-    
-    async def get_product_info(self, product_id: int) -> Dict:
-        """取得產品資訊"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.base_url}/api/inventory/products/{product_id}")
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Inventory service unavailable: {str(e)}")
+    def __init__(self, base_url: str | None = None, transport: httpx.AsyncBaseTransport | None = None):
+        self.base_url = base_url or require("INVENTORY_BASE_URL")
+        self.timeout = httpx.Timeout(float(optional("INVENTORY_TIMEOUT_SECONDS", "5")))
+        self.transport = transport
+        self._client: httpx.AsyncClient | None = None
 
-# 全域實例
-inventory_client = InventoryClient()
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, transport=self.transport,
+                                             headers={"X-Service-Token": auth.settings().service_token})
+        return self._client
+
+    async def aclose(self):
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _request(self, method: str, path: str, **kwargs):
+        try:
+            response = await self._http().request(method, path, headers={"X-Request-ID": request_id_var.get()},
+                                                  **kwargs)
+        except httpx.HTTPError as exc:
+            logger.warning("inventory request failed", extra=log_fields(path=path, error=type(exc).__name__))
+            raise InventoryUnavailable(type(exc).__name__) from exc
+        if response.status_code >= 500 or response.status_code in (401, 403):
+            # 401/403 means a service-token misconfiguration; surface it as unavailable.
+            logger.warning("inventory error response", extra=log_fields(path=path, status=response.status_code))
+            raise InventoryUnavailable(f"status {response.status_code}")
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            raise InventoryRejected(response.status_code, detail)
+        return response.json()
+
+    async def get_product(self, product_id: int) -> dict:
+        return await self._request("GET", f"/api/inventory/products/{product_id}")
+
+    async def reserve(self, reservation_id: str, items: list[dict]) -> dict:
+        return await self._request("POST", "/api/inventory/reservations",
+                                   json={"reservation_id": reservation_id, "items": items})
+
+    async def release(self, reservation_id: str) -> dict:
+        return await self._request("POST", f"/api/inventory/reservations/{reservation_id}/release")
+
+    async def commit(self, reservation_id: str) -> dict:
+        return await self._request("POST", f"/api/inventory/reservations/{reservation_id}/commit")
 
 
+_client: InventoryClient | None = None
+
+
+def get_inventory_client() -> InventoryClient:
+    """FastAPI dependency (tests override it with a fake)."""
+    global _client
+    if _client is None:
+        _client = InventoryClient()
+    return _client

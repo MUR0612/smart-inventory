@@ -1,149 +1,118 @@
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from decimal import Decimal
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from ..db import SessionLocal
-from ..models import Product, Inventory
-from ..cache import get_redis
-import json
-from typing import Optional
+
+from smart_shared.auth import READ_ROLES, WRITE_ROLES, authorize
+from .. import cache
+from ..db import get_db
+from ..models import Inventory, Product
+from ..schemas import InventoryStats, ProductCreate, ProductOut, ProductUpdate
 
 router = APIRouter(prefix="/api/inventory", tags=["products"])
 
-class ProductCreate(BaseModel):
-    sku: str
-    name: str
-    price: float
-    safety_stock: int = 0
-    stock: int = 0
+can_read = authorize(*READ_ROLES, allow_service=True)
+can_write = authorize(*WRITE_ROLES)
 
-class ProductUpdate(BaseModel):
-    name: Optional[str] = None
-    price: Optional[float] = None
-    safety_stock: Optional[int] = None
 
-class ProductOut(BaseModel):
-    id: int
-    sku: str
-    name: str
-    price: float
-    safety_stock: int
-    stock: int
+def _out(p: Product, inv: Inventory) -> ProductOut:
+    return ProductOut(id=p.id, sku=p.sku, name=p.name, price=p.price, safety_stock=p.safety_stock, stock=inv.stock)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-@router.post("/products", response_model=ProductOut)
+def _joined(db: Session):
+    return db.query(Product, Inventory).join(Inventory, Product.id == Inventory.product_id)
+
+
+@router.post("/products", response_model=ProductOut, status_code=201, dependencies=[Depends(can_write)])
 def create_product(body: ProductCreate, db: Session = Depends(get_db)):
-    existing = db.query(Product).filter_by(sku=body.sku).first()
-    if existing:
+    if db.query(Product.id).filter_by(sku=body.sku).first():
         raise HTTPException(status_code=409, detail="SKU already exists")
     p = Product(sku=body.sku, name=body.name, price=body.price, safety_stock=body.safety_stock)
-    db.add(p); db.flush()
-    inv = Inventory(product_id=p.id, stock=body.stock)
-    db.add(inv); db.commit(); db.refresh(p)
-
-    # 失效快取
     try:
-        r = get_redis()
-        r.delete("products:list:v1")
-    except Exception:
-        pass
+        db.add(p)
+        db.flush()
+        inv = Inventory(product_id=p.id, stock=body.stock)
+        db.add(inv)
+        db.commit()
+    except IntegrityError:
+        # Two concurrent creates with the same SKU: the unique index decides.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="SKU already exists")
+    cache.invalidate_products()
+    return _out(p, inv)
 
-    return ProductOut(id=p.id, sku=p.sku, name=p.name, price=float(p.price), safety_stock=p.safety_stock, stock=inv.stock)
 
-@router.get("/products", response_model=list[ProductOut])
-def list_products(db: Session = Depends(get_db)):
-    r = get_redis()
-    cache_key = "products:list:v1"
-    cached = r.get(cache_key)
-    if cached:
-        return [ProductOut(**obj) for obj in json.loads(cached)]
-
-    rows = db.query(Product, Inventory).join(Inventory, Product.id == Inventory.product_id).all()
-    result = [ProductOut(id=p.id, sku=p.sku, name=p.name, price=float(p.price),
-                         safety_stock=p.safety_stock, stock=inv.stock) for p, inv in rows]
-    try:
-        r.setex(cache_key, 30, json.dumps([x.dict() for x in result]))  # TTL 30s
-    except Exception:
-        pass
+@router.get("/products", response_model=list[ProductOut], dependencies=[Depends(can_read)])
+def list_products(response: Response, db: Session = Depends(get_db)):
+    gen = cache.current_generation()  # read before MySQL; see cache.py
+    if gen is not None:
+        cached = cache.get_products(gen)
+        if cached is not None:
+            response.headers["X-Cache"] = "hit"
+            return cached
+    result = [_out(p, inv) for p, inv in _joined(db).order_by(Product.id).all()]
+    if gen is not None:
+        cache.store_products(gen, [r.model_dump(mode="json") for r in result])
+    response.headers["X-Cache"] = "miss" if gen is not None else "bypass"
     return result
 
-@router.get("/products/{product_id}", response_model=ProductOut)
+
+@router.get("/stats", response_model=InventoryStats, dependencies=[Depends(can_read)])
+def inventory_stats(db: Session = Depends(get_db)):
+    """Aggregates computed in SQL with DECIMAL arithmetic (no client-side float sums)."""
+    stock, safety = Inventory.stock, Product.safety_stock
+    row = db.execute(
+        select(
+            func.count(Product.id),
+            func.coalesce(func.sum(stock), 0),
+            func.coalesce(func.sum(Product.price * stock), 0),
+            func.coalesce(func.sum(case((stock > safety, 1), else_=0)), 0),
+            func.coalesce(func.sum(case(((stock > 0) & (stock <= safety), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((stock == 0, 1), else_=0)), 0),
+        ).select_from(Product).join(Inventory, Product.id == Inventory.product_id)
+    ).one()
+    return InventoryStats(total_products=row[0], total_units=row[1],
+                          total_value=Decimal(row[2]).quantize(Decimal("0.01")),
+                          in_stock=row[3], low_stock=row[4], out_of_stock=row[5])
+
+
+@router.get("/products/{product_id}", response_model=ProductOut, dependencies=[Depends(can_read)])
 def get_product(product_id: int, db: Session = Depends(get_db)):
-    row = db.query(Product, Inventory).join(Inventory, Product.id == Inventory.product_id).filter(Product.id == product_id).first()
+    row = _joined(db).filter(Product.id == product_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Product not found")
-    
-    p, inv = row
-    return ProductOut(id=p.id, sku=p.sku, name=p.name, price=float(p.price),
-                     safety_stock=p.safety_stock, stock=inv.stock)
+    return _out(*row)
 
-@router.put("/products/{product_id}", response_model=ProductOut)
+
+@router.put("/products/{product_id}", response_model=ProductOut, dependencies=[Depends(can_write)])
 def update_product(product_id: int, body: ProductUpdate, db: Session = Depends(get_db)):
-    product = db.query(Product).filter(Product.id == product_id).first()
+    changes = body.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Nothing to update")
+    product = db.get(Product, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    
-    # 更新產品資訊
-    if body.name is not None:
-        product.name = body.name
-    if body.price is not None:
-        product.price = body.price
-    if body.safety_stock is not None:
-        product.safety_stock = body.safety_stock
-    
+    for field, value in changes.items():
+        setattr(product, field, value)
     db.commit()
-    db.refresh(product)
-    
-    # 取得庫存資訊
-    inventory = db.query(Inventory).filter(Inventory.product_id == product_id).first()
-    
-    # 失效快取
-    try:
-        r = get_redis()
-        r.delete("products:list:v1")
-        r.delete(f"product:{product_id}:v1")
-    except Exception:
-        pass
-    
-    return ProductOut(id=product.id, sku=product.sku, name=product.name, 
-                     price=float(product.price), safety_stock=product.safety_stock, 
-                     stock=inventory.stock)
+    cache.invalidate_products()
+    return _out(product, db.get(Inventory, product_id))
 
-@router.delete("/products/{product_id}")
+
+@router.delete("/products/{product_id}", dependencies=[Depends(can_write)])
 def delete_product(product_id: int, db: Session = Depends(get_db)):
-    product = db.query(Product).filter(Product.id == product_id).first()
+    product = db.get(Product, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    
-    # 檢查是否有訂單項目引用此產品
-    from sqlalchemy import text
-    order_items_count = db.execute(
-        text("SELECT COUNT(*) FROM order_items WHERE product_id = :pid"),
-        {"pid": product_id}
-    ).scalar()
-    
-    if order_items_count > 0:
-        raise HTTPException(
-            status_code=409, 
-            detail=f"Cannot delete product. It is referenced by {order_items_count} order item(s). Please delete related orders first."
-        )
-    
-    # 刪除產品 (CASCADE 會自動刪除相關的 inventory 記錄)
-    db.delete(product)
-    db.commit()
-    
-    # 失效快取
     try:
-        r = get_redis()
-        r.delete("products:list:v1")
-        r.delete(f"product:{product_id}:v1")
-    except Exception:
-        pass
-    
-    return {"message": "Product deleted successfully"}
-
+        db.delete(product)
+        db.commit()
+    except IntegrityError:
+        # FKs from order_items / stock_reservation_items protect history. This is
+        # the shared-database coupling documented in docs/architecture.md.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Product is referenced by orders or reservations")
+    cache.invalidate_products()
+    return {"message": "Product deleted"}

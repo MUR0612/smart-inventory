@@ -1,47 +1,81 @@
+"""Order service entry point.
+
+Background work (Redis subscriber + inventory reconcile loop) is owned by the
+lifespan: started after startup, cancelled and awaited on shutdown, and any
+unexpected crash of a task is logged instead of disappearing silently.
+"""
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
-from .db import engine
-from .models import Base
-from .routers import health, orders
-from .services.redis_subscriber import redis_subscriber
-import time
-import asyncio
 
-# 等資料庫就緒（最多 20 秒，每秒重試）
-RETRIES = 20
-for i in range(RETRIES):
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("SELECT 1"))
-        break
-    except Exception:
-        if i == RETRIES - 1:
-            raise
-        time.sleep(1)
+from smart_shared import auth, observability
+from smart_shared.config import cors_origins, optional
 
-# 初始化資料表
-Base.metadata.create_all(bind=engine)
+observability.setup_logging("order-service")
+auth.settings()  # validate AUTH_SECRET / SERVICE_TOKEN at startup
 
-app = FastAPI(title="Order Service")
+from .db import SessionLocal  # noqa: E402
+from .routers import health, orders  # noqa: E402
+from .services import order_workflow  # noqa: E402
+from .services.inventory_client import get_inventory_client  # noqa: E402
+from .services.redis_subscriber import redis_subscriber  # noqa: E402
 
-# 添加 CORS 中間件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 允許所有來源
-    allow_credentials=True,
-    allow_methods=["*"],  # 允許所有方法
-    allow_headers=["*"],  # 允許所有標頭
-)
+logger = logging.getLogger("order-service")
+RECONCILE_INTERVAL = float(optional("RECONCILE_INTERVAL_SECONDS", "30"))
 
-@app.on_event("startup")
-async def startup_event():
-    """應用啟動時啟動 Redis 訂閱者"""
-    asyncio.create_task(redis_subscriber.subscribe_to_channels())
+
+async def reconcile_loop():
+    client = get_inventory_client()
+    while True:
+        await asyncio.sleep(RECONCILE_INTERVAL)
+        db = SessionLocal()
+        try:
+            await order_workflow.reconcile_once(db, client)
+        except Exception:
+            logger.exception("reconcile pass failed; will retry")
+        finally:
+            db.close()
+
+
+def _log_task_end(task: asyncio.Task):
+    if not task.cancelled() and task.exception():
+        logger.error("background task %s crashed", task.get_name(), exc_info=task.exception())
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tasks = []
+    if optional("BACKGROUND_TASKS_ENABLED", "true").lower() == "true":
+        tasks = [asyncio.create_task(redis_subscriber.run(), name="redis-subscriber"),
+                 asyncio.create_task(reconcile_loop(), name="inventory-reconcile")]
+        for task in tasks:
+            task.add_done_callback(_log_task_end)
+    yield
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await get_inventory_client().aclose()
+
+
+docs = optional("ENABLE_API_DOCS", "true").lower() == "true"
+app = FastAPI(title="Order Service", lifespan=lifespan,
+              docs_url="/api/orders/docs" if docs else None,
+              openapi_url="/api/orders/openapi.json" if docs else None,
+              redoc_url=None)
+observability.install(app, "order-service")
+
+origins = cors_origins()
+if origins:
+    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False,
+                       allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                       allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"])
 
 app.include_router(health.router)
 app.include_router(orders.router)
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8002)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(optional("PORT", "8002")), log_config=None)

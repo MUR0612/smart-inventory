@@ -1,91 +1,76 @@
-import redis
-import json
+"""Non-blocking Redis Pub/Sub subscriber (demo event log).
+
+Uses ``redis.asyncio`` so waiting for messages never blocks the event loop,
+reconnects with back-off after Redis restarts, and stops cleanly when the
+lifespan cancels the task.
+
+Scope (be honest in docs/demos): handlers only log a compact summary and keep
+the last few events in memory for ``GET /api/orders/events/recent``. There is
+no e-mail, auto-replenishment or live browser push, and Pub/Sub does not
+store messages, so events published while this subscriber is offline are lost.
+Order and stock correctness never depend on these events.
+"""
 import asyncio
-from typing import Dict, Any
+import json
+import logging
+from collections import deque
+
+import redis
+import redis.asyncio as aioredis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+
+from smart_shared.config import redis_settings
+from smart_shared.observability import log_fields
+
+logger = logging.getLogger("order-service.subscriber")
+
+CHANNELS = ("low_stock_alerts", "stock_changes")
+_SUMMARY_FIELDS = ("product_id", "sku", "old_stock", "new_stock", "adjustment", "current_stock",
+                   "safety_stock", "source", "timestamp")
+
 
 class RedisSubscriber:
-    """Redis 訂閱者服務"""
-    
     def __init__(self):
-        try:
-            self.redis_client = redis.Redis(host='redis', port=6379, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
-            self.running = False
-        except Exception as e:
-            print(f"Redis connection failed: {e}")
-            self.redis_client = None
-            self.running = False
-    
-    async def handle_low_stock_alert(self, data: Dict[str, Any]):
-        """處理低庫存警告"""
-        print(f"🚨 Low Stock Alert: {data['sku']} ({data['name']}) - "
-              f"Current: {data['current_stock']}, Safety: {data['safety_stock']}")
-        
-        # 這裡可以添加更多處理邏輯，例如：
-        # - 發送郵件通知
-        # - 更新儀表板
-        # - 記錄到日誌系統
-        # - 觸發自動補貨流程
-    
-    async def handle_stock_change(self, data: Dict[str, Any]):
-        """處理庫存變更通知"""
-        print(f"📦 Stock Change: {data['sku']} ({data['name']}) - "
-              f"Changed by {data['adjustment']} (from {data['old_stock']} to {data['new_stock']})")
-        
-        # 這裡可以添加更多處理邏輯，例如：
-        # - 更新庫存統計
-        # - 觸發重新計算安全庫存
-        # - 更新儀表板數據
-    
-    async def handle_inventory_update(self, data: Dict[str, Any]):
-        """處理庫存更新通知"""
-        print(f"🔄 Inventory Update: {data}")
-        
-        # 這裡可以添加更多處理邏輯
-    
-    async def subscribe_to_channels(self):
-        """訂閱所有相關頻道"""
-        if not self.redis_client:
-            print("❌ Redis client not available, skipping subscription")
-            return
-            
-        try:
-            pubsub = self.redis_client.pubsub()
-            
-            # 訂閱頻道
-            pubsub.subscribe(
-                'low_stock_alerts',
-                'stock_changes', 
-                'inventory_updates'
-            )
-            
-            print("🔔 Subscribed to Redis channels: low_stock_alerts, stock_changes, inventory_updates")
-            
-            self.running = True
-            for message in pubsub.listen():
-                if not self.running:
-                    break
-                    
-                if message['type'] == 'message':
-                    channel = message['channel']
-                    data = json.loads(message['data'])
-                    
-                    if channel == 'low_stock_alerts':
-                        await self.handle_low_stock_alert(data)
-                    elif channel == 'stock_changes':
-                        await self.handle_stock_change(data)
-                    elif channel == 'inventory_updates':
-                        await self.handle_inventory_update(data)
-                        
-        except Exception as e:
-            print(f"❌ Redis subscription error: {e}")
-        finally:
-            if 'pubsub' in locals():
-                pubsub.close()
-            print("🔕 Redis subscription closed")
-    
-    def stop(self):
-        """停止訂閱"""
-        self.running = False
+        self.recent: deque[dict] = deque(maxlen=20)
+        self.connected = False
 
-# 全域實例
+    def handle(self, channel: str, raw: str):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            logger.warning("ignoring malformed event", extra=log_fields(channel=channel))
+            return
+        summary = {"channel": channel, **{k: data.get(k) for k in _SUMMARY_FIELDS if k in data}}
+        self.recent.appendleft(summary)
+        logger.info("event received", extra=log_fields(**summary))
+
+    async def run(self):
+        delay = 1.0
+        settings = redis_settings()
+        while True:
+            client = aioredis.Redis(host=settings["host"], port=settings["port"], decode_responses=True,
+                                    socket_connect_timeout=2, health_check_interval=15,
+                                    retry=Retry(NoBackoff(), 0))  # reconnects are handled below
+            pubsub = client.pubsub(ignore_subscribe_messages=True)
+            try:
+                await pubsub.subscribe(*CHANNELS)
+                self.connected = True
+                delay = 1.0
+                logger.info("subscribed", extra=log_fields(channels=list(CHANNELS)))
+                while True:
+                    message = await pubsub.get_message(timeout=1.0)
+                    if message and message.get("type") == "message":
+                        self.handle(message["channel"], message["data"])
+            except (redis.RedisError, OSError) as exc:
+                logger.warning("subscription lost; reconnecting",
+                               extra=log_fields(error=type(exc).__name__, retry_in_seconds=delay))
+            finally:
+                self.connected = False
+                await pubsub.aclose()
+                await client.aclose()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
 redis_subscriber = RedisSubscriber()

@@ -1,0 +1,3 @@
+# Test-only packages for the services' unit tests (scripts/test-unit.sh).
+pytest==9.1.1
+httpx==0.28.1
